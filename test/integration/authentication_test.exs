@@ -112,9 +112,7 @@ defmodule RpcEx.Integration.AuthenticationTest do
       server =
         start_supervised!(
           {Server,
-           router: AuthenticatedRouter,
-           port: port,
-           auth: {RpcEx.Test.Support.TestAuth, []}}
+           router: AuthenticatedRouter, port: port, auth: {RpcEx.Test.Support.TestAuth, []}}
         )
 
       %{port: port, server: server}
@@ -178,20 +176,14 @@ defmodule RpcEx.Integration.AuthenticationTest do
       port = Enum.random(40_000..49_000)
 
       server =
-        start_supervised!(
-          {Server,
-           router: AuthenticatedRouter,
-           port: port}
-        )
+        start_supervised!({Server, router: AuthenticatedRouter, port: port})
 
       %{port: port, server: server}
     end
 
     test "clients can connect without credentials", %{port: port} do
       {:ok, client} =
-        Client.start_link(
-          url: "ws://localhost:#{port}/"
-        )
+        Client.start_link(url: "ws://localhost:#{port}/")
 
       wait_for_ready(client)
 
