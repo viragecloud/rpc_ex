@@ -45,15 +45,16 @@ defmodule RpcEx.Server.WebSocketHandler do
   end
 
   def handle_in({data, opcode: :binary}, %{negotiated?: true, connection: conn} = state) do
-    with {:ok, frame} <- Frame.decode(data) do
-      case frame.type do
-        type when type in [:reply, :error] ->
-          handle_peer_response(frame, state)
+    case Frame.decode(data) do
+      {:ok, frame} ->
+        case frame.type do
+          type when type in [:reply, :error] ->
+            handle_peer_response(frame, state)
 
-        _ ->
-          dispatch_frame(frame, state, conn)
-      end
-    else
+          _ ->
+            dispatch_frame(frame, state, conn)
+        end
+
       {:error, reason} ->
         {:stop, {:error, {:invalid_frame, reason}}, {1003, reason_to_binary(reason)}, state}
     end

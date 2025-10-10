@@ -8,8 +8,8 @@ defmodule RpcEx.Server do
   developed incrementally; this module captures the intended public API.
   """
 
-  alias RpcEx.Reflection
   alias Bandit
+  alias RpcEx.Reflection
 
   @type option ::
           {:router, module()}

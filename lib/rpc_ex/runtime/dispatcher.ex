@@ -30,23 +30,24 @@ defmodule RpcEx.Runtime.Dispatcher do
           keyword()
         ) :: dispatch_result()
   def dispatch_call(router, payload, context, session, opts \\ []) do
-    with {:ok, route} <- fetch_route(payload) do
-      args = Map.get(payload, :args, %{})
-      msg_id = Map.get(payload, :msg_id)
-      dispatch_opts = build_call_opts(payload, opts)
-      base_context = build_context(context, session, Map.get(payload, :meta))
+    case fetch_route(payload) do
+      {:ok, route} ->
+        args = Map.get(payload, :args, %{})
+        msg_id = Map.get(payload, :msg_id)
+        dispatch_opts = build_call_opts(payload, opts)
+        base_context = build_context(context, session, Map.get(payload, :meta))
 
-      case Executor.dispatch(router, :call, route, args, base_context, dispatch_opts) do
-        {:ok, result, new_ctx} ->
-          respond_call(route, msg_id, result, new_ctx)
+        case Executor.dispatch(router, :call, route, args, base_context, dispatch_opts) do
+          {:ok, result, new_ctx} ->
+            respond_call(route, msg_id, result, new_ctx)
 
-        {:halt, result, new_ctx} ->
-          respond_call(route, msg_id, result, new_ctx)
+          {:halt, result, new_ctx} ->
+            respond_call(route, msg_id, result, new_ctx)
 
-        {:error, {:unknown_route, _}} ->
-          {error_action(:call, route, msg_id), context}
-      end
-    else
+          {:error, {:unknown_route, _}} ->
+            {error_action(:call, route, msg_id), context}
+        end
+
       {:error, reason} ->
         log_invalid_payload(:call, reason, payload)
         {error_action(:call, nil, Map.get(payload, :msg_id), reason), context}
@@ -64,22 +65,23 @@ defmodule RpcEx.Runtime.Dispatcher do
           keyword()
         ) :: dispatch_result()
   def dispatch_cast(router, payload, context, session, opts \\ []) do
-    with {:ok, route} <- fetch_route(payload) do
-      args = Map.get(payload, :args, %{})
-      dispatch_opts = build_cast_opts(payload, opts)
-      base_context = build_context(context, session, Map.get(payload, :meta))
+    case fetch_route(payload) do
+      {:ok, route} ->
+        args = Map.get(payload, :args, %{})
+        dispatch_opts = build_cast_opts(payload, opts)
+        base_context = build_context(context, session, Map.get(payload, :meta))
 
-      case Executor.dispatch(router, :cast, route, args, base_context, dispatch_opts) do
-        {:ok, result, new_ctx} ->
-          respond_cast(route, result, new_ctx)
+        case Executor.dispatch(router, :cast, route, args, base_context, dispatch_opts) do
+          {:ok, result, new_ctx} ->
+            respond_cast(route, result, new_ctx)
 
-        {:halt, result, new_ctx} ->
-          respond_cast(route, result, new_ctx)
+          {:halt, result, new_ctx} ->
+            respond_cast(route, result, new_ctx)
 
-        {:error, {:unknown_route, _}} ->
-          {log_unknown_cast(route), context}
-      end
-    else
+          {:error, {:unknown_route, _}} ->
+            {log_unknown_cast(route), context}
+        end
+
       {:error, reason} ->
         log_invalid_payload(:cast, reason, payload)
         {:noreply, context}

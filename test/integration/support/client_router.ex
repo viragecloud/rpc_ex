@@ -1,4 +1,5 @@
 defmodule RpcEx.Test.Integration.ClientRouter do
+  @moduledoc false
   use RpcEx.Router
 
   middleware RpcEx.Test.Middlewares.Trace, tag: :client
