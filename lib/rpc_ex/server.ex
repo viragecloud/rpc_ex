@@ -37,7 +37,7 @@ defmodule RpcEx.Server do
     router = Keyword.fetch!(opts, :router)
     scheme = Keyword.get(opts, :scheme, @default_scheme)
     port = opts |> Keyword.get(:port, @default_port) |> normalize_port()
-    name = Keyword.get(opts, :name, __MODULE__)
+    name = Keyword.get(opts, :name)
 
     plug_opts = [
       router: router,
@@ -59,11 +59,17 @@ defmodule RpcEx.Server do
       |> Keyword.merge(
         plug: {RpcEx.Server.Endpoint, plug_opts},
         scheme: scheme,
-        port: port,
-        name: name
+        port: port
       )
 
-    Bandit.start_link(bandit_opts)
+    case Bandit.start_link(bandit_opts) do
+      {:ok, pid} = ok ->
+        maybe_register(name, pid)
+        ok
+
+      other ->
+        other
+    end
   end
 
   @doc """
@@ -104,4 +110,16 @@ defmodule RpcEx.Server do
   defp normalize_port(port) when is_integer(port), do: port
   defp normalize_port(port) when is_binary(port), do: String.to_integer(port)
   defp normalize_port(_), do: @default_port
+
+  defp maybe_register(nil, _pid), do: :ok
+
+  defp maybe_register({:via, module, term}, pid) do
+    module.register_name(term, pid)
+  end
+
+  defp maybe_register(name, pid) when is_atom(name) do
+    Process.register(pid, name)
+  rescue
+    ArgumentError -> :ok
+  end
 end

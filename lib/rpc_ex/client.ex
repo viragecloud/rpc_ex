@@ -137,7 +137,9 @@ defmodule RpcEx.Client do
       reconnect: Keyword.get(opts, :reconnect, []),
       buffer: %{},
       awaiting_welcome?: false,
-      upgrade_status: nil
+      upgrade_status: nil,
+      upgrade_headers: nil,
+      upgrade_done: false
     }
 
     {:ok, state, {:continue, :connect}}
@@ -244,12 +246,12 @@ defmodule RpcEx.Client do
 
   @impl GenServer
   def handle_info(message, state) do
-    case HTTP.stream(state.conn, message) do
+    case WebSocket.stream(state.conn, message) do
       {:ok, conn, responses} ->
         handle_responses(responses, %{state | conn: conn})
 
-      {:error, conn, reason, _responses} ->
-        Logger.error("RPC client connection error: #{inspect(reason)}")
+      {:error, conn, reason, responses} ->
+        Logger.error("RPC client connection error: #{inspect(reason)} responses=#{inspect(responses)}")
         {:stop, {:error, reason}, %{state | conn: conn}}
 
       :unknown ->
@@ -264,7 +266,7 @@ defmodule RpcEx.Client do
   def terminate(_reason, state) do
     if state.conn && state.websocket && state.request_ref do
       with {:ok, _websocket, data} <- WebSocket.encode(state.websocket, {:close, 1000, ""}),
-           {:ok, _conn} <- HTTP.stream_request_body(state.conn, state.request_ref, data) do
+           {:ok, _conn} <- WebSocket.stream_request_body(state.conn, state.request_ref, data) do
         :ok
       else
         _ -> :ok
@@ -280,6 +282,7 @@ defmodule RpcEx.Client do
     with {:ok, conn} <- HTTP.connect(state.scheme, state.host, state.port, state.transport_opts),
          {:ok, conn, ref} <-
            WebSocket.upgrade(
+             ws_scheme(state.scheme),
              conn,
              state.path,
              [
@@ -302,33 +305,16 @@ defmodule RpcEx.Client do
   end
 
   defp handle_responses(responses, state) do
-    Enum.reduce_while(responses, {:noreply, state}, fn
+    if state.status == :awaiting_upgrade do
+      Logger.debug("upgrade responses: #{inspect(responses)}")
+    end
+    responses
+    |> Enum.reduce_while({:noreply, state}, fn
       {:status, ref, status}, {:noreply, state} when ref == state.request_ref ->
         {:cont, {:noreply, %{state | upgrade_status: status}}}
 
       {:headers, ref, headers}, {:noreply, state} when ref == state.request_ref ->
-        status = state.upgrade_status || 101
-
-        case WebSocket.new(state.conn, ref, status, headers) do
-          {:ok, conn, websocket} ->
-            case send_frame(Frame.new(:hello, state.local_handshake_payload), %{
-                   state
-                   | conn: conn,
-                     websocket: websocket,
-                     status: :awaiting_welcome,
-                     awaiting_welcome?: true,
-                     upgrade_status: nil
-                 }) do
-              {:ok, new_state} ->
-                {:cont, {:noreply, new_state}}
-
-              {:error, reason, new_state} ->
-                {:halt, {:stop, reason, new_state}}
-            end
-
-          {:error, conn, reason} ->
-            {:halt, {:stop, reason, %{state | conn: conn}}}
-        end
+        {:cont, {:noreply, %{state | upgrade_headers: headers}}}
 
       {:data, ref, data}, {:noreply, %{websocket: websocket} = state}
       when ref == state.request_ref ->
@@ -346,11 +332,13 @@ defmodule RpcEx.Client do
         end
 
       {:done, ref}, {:noreply, state} when ref == state.request_ref ->
-        {:cont, {:noreply, state}}
+        {:cont, {:noreply, %{state | upgrade_done: true}}}
 
       _response, {:noreply, state} ->
         {:cont, {:noreply, state}}
     end)
+    |> maybe_finalize_upgrade()
+    |> normalize_response()
   end
 
   defp handle_ws_frames(frames, state) do
@@ -489,24 +477,15 @@ defmodule RpcEx.Client do
   end
 
   defp send_ws_frame(frame_tuple, %{websocket: websocket, conn: conn, request_ref: ref} = state) do
-    with {:ok, websocket, data} <- WebSocket.encode(websocket, frame_tuple) do
-      case HTTP.stream_request_body(conn, ref, data) do
-        {:ok, conn} ->
-          {:ok, %{state | websocket: websocket, conn: conn}}
-
-        {:ok, conn, responses} ->
-          state = %{state | websocket: websocket, conn: conn}
-          case handle_responses(responses, state) do
-            {:noreply, new_state} -> {:ok, new_state}
-            {:stop, reason, new_state} -> {:error, reason, new_state}
-          end
-
-        {:error, conn, reason} ->
-          {:error, reason, %{state | conn: conn, websocket: websocket}}
-      end
+    with {:ok, websocket, data} <- WebSocket.encode(websocket, frame_tuple),
+         {:ok, conn} <- WebSocket.stream_request_body(conn, ref, data) do
+      {:ok, %{state | websocket: websocket, conn: conn}}
     else
       {:error, websocket, reason} ->
         {:error, reason, %{state | websocket: websocket}}
+
+      {:error, conn, reason} ->
+        {:error, reason, %{state | conn: conn}}
     end
   end
 
@@ -516,8 +495,14 @@ defmodule RpcEx.Client do
   defp normalize_scheme("https"), do: :https
   defp normalize_scheme(nil), do: :http
 
-  defp normalize_scheme(other),
-    do: raise(ArgumentError, "unsupported scheme #{inspect(other)}")
+  defp normalize_scheme(other) do
+    raise ArgumentError, "unsupported scheme #{inspect(other)}"
+  end
+
+  defp ws_scheme(:https), do: :wss
+  defp ws_scheme(:http), do: :ws
+  defp ws_scheme(:wss), do: :wss
+  defp ws_scheme(:ws), do: :ws
 
   defp normalize_path(nil, nil), do: "/"
   defp normalize_path("", nil), do: "/"
@@ -531,6 +516,63 @@ defmodule RpcEx.Client do
     default = default_port(scheme)
     if port == default, do: host, else: "#{host}:#{port}"
   end
+
+  defp complete_upgrade(%{status: :awaiting_upgrade, upgrade_headers: headers} = state, ref)
+       when is_list(headers) do
+    status = state.upgrade_status || 101
+
+    try do
+      case WebSocket.new(state.conn, ref, status, headers) do
+        {:ok, conn, websocket} ->
+          state = %{
+            state
+            | conn: conn,
+              websocket: websocket,
+              status: :awaiting_welcome,
+              awaiting_welcome?: true,
+              upgrade_status: nil,
+              upgrade_headers: nil,
+              upgrade_done: false
+          }
+
+          case send_frame(Frame.new(:hello, state.local_handshake_payload), state) do
+            {:ok, new_state} -> {:ok, new_state}
+            {:error, reason, new_state} -> {:error, reason, new_state}
+          end
+
+        {:error, conn, reason} ->
+          {:error, reason, %{state | conn: conn}}
+      end
+    rescue
+      exception ->
+        Logger.error("Mint.WebSocket.new failed: #{inspect(exception)}")
+        {:error, exception, state}
+    end
+  end
+
+  defp complete_upgrade(state, _ref), do: {:ok, state}
+
+  defp maybe_finalize_upgrade({:noreply, state}) do
+    case complete_upgrade_if_ready(state) do
+      {:ok, new_state} -> {:noreply, new_state}
+      {:error, reason, new_state} -> {:stop, reason, new_state}
+    end
+  end
+
+  defp maybe_finalize_upgrade(other), do: other
+
+  defp complete_upgrade_if_ready(%{status: :awaiting_upgrade, upgrade_done: true} = state) do
+    Logger.debug("completing upgrade with headers=#{inspect(state.upgrade_headers)} status=#{inspect(state.upgrade_status)}")
+    case state.upgrade_headers do
+      headers when is_list(headers) -> complete_upgrade(state, state.request_ref)
+      _ -> {:ok, state}
+    end
+  end
+
+  defp complete_upgrade_if_ready(state), do: {:ok, state}
+
+  defp normalize_response({:stop, reason, state}), do: {:stop, reason, state}
+  defp normalize_response(other), do: other
 
   defp generate_id do
     :erlang.unique_integer([:positive, :monotonic])
