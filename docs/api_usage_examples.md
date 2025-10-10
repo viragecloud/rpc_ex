@@ -35,11 +35,8 @@ defmodule MyApp.RPCServer do
       {RpcEx.Server,
        router: MyApp.RPC,
        port: 4444,
-       transport: :bandit,
-       compression: :enabled,
-       discovery: true,
-       max_inflight: 10_000,
-       handshake: [token_validator: &MyApp.Auth.validate/1],
+       auth: {MyApp.Auth, []},
+       context: %{server_id: "main"},
        telemetry_prefix: [:my_app, :rpc]}
     ]
 
@@ -66,19 +63,141 @@ defmodule MyApp.RPCClient do
       {RpcEx.Client,
        name: __MODULE__,
        url: "wss://rpc.myapp.test/socket",
-       reconnect: [strategy: :exponential, max_delay: 5_000],
-       compression: :enabled,
-       timeout: 5_000,
-       discovery: true,
-       router: MyApp.ClientHandlers}
+       router: MyApp.ClientHandlers,
+       context: %{client_id: "app-1"},
+       handshake: [
+         meta: %{
+           "auth" => %{
+             "token" => get_auth_token()
+           },
+           "version" => "1.0.0"
+         }
+       ]}
     ]
 
     Supervisor.init(children, strategy: :one_for_one)
+  end
+
+  defp get_auth_token do
+    # Retrieve token from environment, config, or secure storage
+    System.get_env("RPC_AUTH_TOKEN")
   end
 end
 ```
 
 The client wraps a Mint WebSocket connection, offering synchronous convenience functions and async callbacks.
+
+### Authentication
+
+Clients pass credentials in the `:handshake` option's `meta` field under the `"auth"` key. The structure is application-defined and must match what the server's auth module expects:
+
+```elixir
+# Token-based authentication
+handshake: [
+  meta: %{
+    "auth" => %{"token" => "jwt-token-here"}
+  }
+]
+
+# Username/password authentication
+handshake: [
+  meta: %{
+    "auth" => %{
+      "username" => "alice",
+      "password" => "secret123"
+    }
+  }
+]
+
+# API key authentication
+handshake: [
+  meta: %{
+    "auth" => %{"api_key" => "sk_live_..."}
+  }
+]
+```
+
+If authentication fails, the client connection will be terminated and can automatically reconnect with the same credentials (if reconnection is enabled).
+
+## Implementing Server Authentication
+
+Create an authentication module implementing the `RpcEx.Server.Auth` behaviour:
+
+```elixir
+defmodule MyApp.Auth do
+  @behaviour RpcEx.Server.Auth
+
+  @impl true
+  def authenticate(credentials, _opts) do
+    case credentials do
+      # Token-based authentication
+      %{"token" => token} ->
+        case MyApp.Accounts.verify_token(token) do
+          {:ok, user} ->
+            {:ok, %{
+              user_id: user.id,
+              username: user.username,
+              roles: user.roles,
+              authenticated: true
+            }}
+
+          {:error, :invalid_token} ->
+            {:error, :invalid_credentials, "Invalid or expired token"}
+
+          {:error, reason} ->
+            {:error, :authentication_failed, reason}
+        end
+
+      # Username/password authentication
+      %{"username" => username, "password" => password} ->
+        case MyApp.Accounts.authenticate(username, password) do
+          {:ok, user} ->
+            {:ok, %{
+              user_id: user.id,
+              username: username,
+              roles: user.roles,
+              authenticated: true
+            }}
+
+          {:error, _} ->
+            {:error, :invalid_credentials, "Invalid username or password"}
+        end
+
+      # Missing credentials
+      _ ->
+        {:error, :missing_credentials, "No authentication credentials provided"}
+    end
+  end
+end
+```
+
+The context returned by `authenticate/2` is merged into the handler context, making it available to all route handlers:
+
+```elixir
+defmodule MyApp.RPC do
+  use RpcEx.Router
+
+  call :get_profile do
+    # Auth context is available
+    user_id = context.user_id
+
+    case MyApp.Accounts.get_profile(user_id) do
+      {:ok, profile} -> {:ok, profile}
+      {:error, _} -> {:error, :not_found}
+    end
+  end
+
+  call :admin_action do
+    # Check roles from auth context
+    if :admin in context.roles do
+      perform_admin_action(args)
+      {:ok, :success}
+    else
+      {:error, :forbidden}
+    end
+  end
+end
+```
 
 ## Client Handlers for Server-Initiated RPC
 
@@ -193,26 +312,58 @@ During shutdown, both client and server modules expose `stop/1` to flush in-flig
 
 ## Configuration Summary
 
-- `RpcEx.Server` options:
-  - `:router` (module) **required**
-  - `:port` / `:url`
-  - `:transport` (`:bandit` default)
-  - `:compression` (`:enabled | :disabled`)
-  - `:discovery` (boolean)
-  - `:max_inflight` (integer)
-  - `:timeout` (default per-call)
-  - `:handshake` (keyword for auth/challenge)
-  - `:telemetry_prefix` (list)
+### `RpcEx.Server` Options
 
-- `RpcEx.Client` options:
-  - `:name` (Registry alias)
-  - `:url`
-  - `:router` (module for inbound RPC)
-  - `:timeout`
-  - `:compression`
-  - `:discovery`
-  - `:reconnect` (strategy options)
-  - `:telemetry_prefix`
-  - `:handshake` (auth metadata function)
+- `:router` (module) - **Required**. Router module defining call/cast handlers
+- `:port` (integer) - Port to listen on (default: 4000)
+- `:scheme` (`:http | :https`) - Protocol scheme (default: `:http`)
+- `:auth` (`{module(), keyword()}`) - Authentication module and options
+- `:context` (map) - Base context merged into all handler contexts
+- `:handshake` (keyword) - Additional handshake configuration
+  - `:protocol_version` (integer) - Protocol version to advertise
+  - `:capabilities` (list of atoms) - Capabilities to advertise
+  - `:compression` (`:enabled | :disabled`) - Enable compression
+  - `:supported_encodings` (list) - Supported encodings (default: `[:etf]`)
+  - `:meta` (map) - Additional metadata in handshake
+- `:telemetry_prefix` (list) - Telemetry event prefix
 
-These examples outline the ergonomic goals for the library: minimal boilerplate, clear supervision integration, explicit timeouts, discoverability, and full telemetry coverage.
+### `RpcEx.Client` Options
+
+- `:url` (string) - **Required**. WebSocket URL (`ws://` or `wss://`)
+- `:router` (module) - Optional router for server-initiated RPC
+- `:context` (map) - Base context for handlers
+- `:handshake` (keyword) - Handshake configuration
+  - `:protocol_version` (integer) - Protocol version to request
+  - `:capabilities` (list) - Capabilities to advertise
+  - `:compression` (`:enabled | :disabled`) - Enable compression
+  - `:enable_notifications` (boolean) - Enable notification capability
+  - `:meta` (map) - Metadata including `"auth"` for credentials
+- `:reconnect` (boolean) - Enable automatic reconnection (default: `true`)
+- `:name` (atom) - Optional process name for registration
+
+### Authentication Configuration
+
+Server authentication is configured via the `:auth` option:
+
+```elixir
+# Basic auth module
+auth: {MyApp.Auth, []}
+
+# Auth module with options
+auth: {MyApp.Auth, [valid_token: "secret", timeout: 5000]}
+
+# No authentication
+auth: nil  # or omit the option
+```
+
+Client credentials are passed via handshake metadata:
+
+```elixir
+handshake: [
+  meta: %{
+    "auth" => %{"token" => "..."}
+  }
+]
+```
+
+These examples reflect the actual implemented API for the library: minimal boilerplate, clear supervision integration, pluggable authentication, and comprehensive protocol support.

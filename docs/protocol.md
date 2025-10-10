@@ -177,10 +177,108 @@ Periodic keepalive to detect stale connections. Payload:
 - Handlers run in supervised asynchronous tasks; the WebSocket process only manages encode/decode and dispatch.
 - Optional `:throttle` notifications MAY be introduced in future versions; reserved payload key `:throttle`.
 
-## Security Considerations
-- Authentication should occur during handshake via `meta` or a custom challenge-response.
-- Sensitive data in payloads must rely on transport security (TLS) and optional encryption layers if required.
-- Both peers MUST validate routes against registered handlers to avoid arbitrary execution.
+## Authentication & Security
+
+### Authentication During Handshake
+
+RpcEx supports pluggable authentication that occurs during the WebSocket handshake, before any RPC messages are exchanged. This ensures that only authenticated clients can establish connections.
+
+#### Server-Side Authentication
+
+Servers can configure authentication by implementing the `RpcEx.Server.Auth` behaviour and passing it as the `:auth` option:
+
+```elixir
+defmodule MyApp.TokenAuth do
+  @behaviour RpcEx.Server.Auth
+
+  @impl true
+  def authenticate(credentials, _opts) do
+    case validate_token(credentials) do
+      {:ok, user} ->
+        # Return context that will be available to all handlers
+        {:ok, %{user_id: user.id, roles: user.roles, authenticated: true}}
+
+      {:error, reason} ->
+        {:error, :invalid_token, reason}
+    end
+  end
+end
+
+# Configure server with auth
+{RpcEx.Server, router: MyRouter, port: 4000, auth: {MyApp.TokenAuth, []}}
+```
+
+The `authenticate/2` callback receives:
+- `credentials`: The value from `meta["auth"]` in the `:hello` frame
+- `opts`: Options passed when configuring the auth module
+
+It must return:
+- `{:ok, auth_context}` - A map that will be merged into the handler `context`
+- `{:error, reason}` or `{:error, reason, detail}` - Authentication failure
+
+#### Client-Side Credentials
+
+Clients pass credentials in the `:hello` frame's `meta` field under the `"auth"` key:
+
+```elixir
+{:ok, client} = RpcEx.Client.start_link(
+  url: "ws://localhost:4000",
+  handshake: [
+    meta: %{
+      "auth" => %{
+        "token" => "jwt-token-here"
+      }
+    }
+  ]
+)
+```
+
+The credentials structure is flexible and application-defined. Common patterns:
+- Token-based: `%{"token" => "..."}`
+- Username/password: `%{"username" => "...", "password" => "..."}`
+- API keys: `%{"api_key" => "..."}`
+- Custom challenges: `%{"challenge_response" => "..."}`
+
+#### Authentication Flow
+
+1. Client sends `:hello` frame with `meta: %{"auth" => credentials}`
+2. Server extracts credentials from `meta["auth"]`
+3. Server calls `AuthModule.authenticate(credentials, opts)`
+4. On success:
+   - Server merges auth context into connection context
+   - Server sends `:welcome` frame
+   - Connection proceeds normally
+5. On failure:
+   - Server sends `{:close, :authentication_failed, reason}` frame
+   - Connection is terminated
+   - Client receives disconnection event
+
+#### Handler Access to Auth Context
+
+Once authenticated, handlers receive the auth context merged into their `context` binding:
+
+```elixir
+call :get_profile do
+  # Auth context is available
+  user_id = context.user_id
+  roles = context.roles
+
+  if :admin in roles do
+    {:ok, get_admin_profile(user_id)}
+  else
+    {:ok, get_user_profile(user_id)}
+  end
+end
+```
+
+### General Security Considerations
+
+- **Transport Security**: Sensitive data in payloads must rely on transport security (TLS/WSS). Use `wss://` URLs in production.
+- **Route Validation**: Both peers MUST validate routes against registered handlers to avoid arbitrary execution.
+- **Credential Storage**: Never log or store credentials in plaintext. Authentication modules should use secure comparison functions.
+- **Token Rotation**: For long-lived connections, consider implementing token refresh via a dedicated RPC route.
+- **Rate Limiting**: Applications should implement rate limiting in middleware to prevent abuse.
+- **Input Validation**: Always validate and sanitize `args` in handlers before processing.
 
 ## Versioning
 - Protocol version currently `1`. Negotiation occurs in `:hello`/`:welcome`.
