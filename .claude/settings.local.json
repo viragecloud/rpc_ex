@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(mix test:*)"
+      "Bash(mix test:*)",
+      "Bash(mix docs:*)",
+      "Bash(MIX_ENV=test mix test --cover)",
+      "Bash(MIX_ENV=test mix test --cover --include integration)"
     ],
     "deny": [],
     "ask": []

@@ -56,12 +56,52 @@ defmodule RpcEx.MixProject do
 
   defp docs do
     [
+      name: "RpcEx",
+      source_url: "https://github.com/virage/rpc_ex",
+      homepage_url: "https://github.com/virage/rpc_ex",
       main: "readme",
       extras: [
         "README.md",
-        "docs/project_plan.md",
         "docs/protocol.md",
-        "docs/api_usage_examples.md"
+        "docs/project_plan.md",
+        "CLAUDE.md"
+      ],
+      groups_for_extras: [
+        Introduction: ["README.md"],
+        Guides: ["docs/protocol.md"],
+        Development: ["docs/project_plan.md", "CLAUDE.md"]
+      ],
+      groups_for_modules: [
+        "Client & Server": [
+          RpcEx.Client,
+          RpcEx.Server
+        ],
+        Protocol: [
+          RpcEx.Protocol.Frame,
+          RpcEx.Protocol.Handshake,
+          RpcEx.Codec
+        ],
+        "Router & Routing": [
+          RpcEx.Router,
+          RpcEx.Router.Route,
+          RpcEx.Router.Middleware,
+          RpcEx.Reflection
+        ],
+        Runtime: [
+          RpcEx.Runtime.Dispatcher,
+          RpcEx.Peer
+        ],
+        "Internal - Client": [
+          RpcEx.Client.Connection
+        ],
+        "Internal - Server": [
+          RpcEx.Server.Endpoint,
+          RpcEx.Server.Connection,
+          RpcEx.Server.WebSocketHandler
+        ],
+        Authentication: [
+          RpcEx.Server.Auth
+        ]
       ]
     ]
   end

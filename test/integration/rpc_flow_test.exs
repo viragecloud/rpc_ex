@@ -11,16 +11,12 @@ defmodule RpcEx.Integration.RpcFlowTest do
     port = Enum.random(40_000..49_000)
 
     server =
-      start_supervised!({Server,
-        router: RpcEx.Test.Integration.ServerRouter,
-        port: port
-      })
+      start_supervised!({Server, router: RpcEx.Test.Integration.ServerRouter, port: port})
 
     client =
-      start_supervised!({Client,
-        url: "ws://localhost:#{port}/",
-        router: RpcEx.Test.Integration.ClientRouter
-      })
+      start_supervised!(
+        {Client, url: "ws://localhost:#{port}/", router: RpcEx.Test.Integration.ClientRouter}
+      )
 
     wait_for_ready(client)
 
@@ -49,7 +45,9 @@ defmodule RpcEx.Integration.RpcFlowTest do
 
   defp wait_for_ready(client, attempts) do
     case :sys.get_state(client) do
-      %{status: :ready} -> :ok
+      %{status: :ready} ->
+        :ok
+
       _ ->
         Process.sleep(50)
         wait_for_ready(client, attempts - 1)

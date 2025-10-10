@@ -5,6 +5,71 @@ defmodule RpcEx.Router do
   Modules using this DSL can expose both `call` (request/response) and `cast`
   (fire-and-forget) endpoints. The DSL captures route metadata for discovery and
   provides introspection helpers used by the runtime.
+
+  ## Example
+
+      defmodule MyApp.Router do
+        use RpcEx.Router
+
+        # Apply middleware to all subsequent routes
+        middleware MyApp.LoggingMiddleware
+        middleware MyApp.AuthMiddleware, role: :user
+
+        # Define a call handler (request/response)
+        call :get_user do
+          user_id = args[:user_id]
+          user = MyApp.Users.get(user_id)
+          {:ok, user}
+        end
+
+        # Define a cast handler (fire-and-forget)
+        cast :log_event do
+          Logger.info("Event: \#{inspect(args)}")
+          :ok
+        end
+
+        # Handler with timeout option
+        call :long_task, timeout: 30_000 do
+          result = MyApp.Tasks.run_long_operation(args)
+          {:ok, result}
+        end
+      end
+
+  ## Handler Context
+
+  Handlers have access to three injected variables:
+
+  - `args` - Map of arguments passed by the caller
+  - `context` - Connection context (contains session, peer handle, custom data)
+  - `opts` - Route options passed at call time
+
+  ## Return Values
+
+  Call handlers should return:
+
+  - `{:ok, result}` - Success with result
+  - `{:error, reason}` - Error response
+  - `{:notify, payload}` - Send a notification and no reply
+  - `:noreply` - Don't send a reply
+
+  Cast handlers should return `:ok`, `{:notify, payload}`, or `:noreply`.
+
+  ## Middleware
+
+  Middleware can be applied to routes using the `middleware/1` or `middleware/2` macro.
+  Middleware is executed in the order it's declared and wraps the handler execution.
+
+      defmodule MyApp.AuthMiddleware do
+        @behaviour RpcEx.Router.Middleware
+
+        def call(context, next_middleware, opts) do
+          if authorized?(context, opts) do
+            next_middleware.(context)
+          else
+            {:error, :unauthorized}
+          end
+        end
+      end
   """
 
   @type middleware :: module() | {module(), keyword()}

@@ -11,10 +11,7 @@ defmodule RpcEx.Integration.ClientConnectTest do
     port = Enum.random(40_000..49_000)
 
     server =
-      start_supervised!({Server,
-        router: RpcEx.Test.Integration.ServerRouter,
-        port: port
-      })
+      start_supervised!({Server, router: RpcEx.Test.Integration.ServerRouter, port: port})
 
     %{port: port, server: server, tracker: tracker}
   end
@@ -38,7 +35,9 @@ defmodule RpcEx.Integration.ClientConnectTest do
 
   defp wait_for_ready(client, attempts) do
     case :sys.get_state(client) do
-      %{connection_status: :ready} -> :ok
+      %{connection_status: :ready} ->
+        :ok
+
       _ ->
         Process.sleep(50)
         wait_for_ready(client, attempts - 1)

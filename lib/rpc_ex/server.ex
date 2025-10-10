@@ -3,9 +3,62 @@ defmodule RpcEx.Server do
   Bandit-based RPC server that terminates WebSocket connections and dispatches
   inbound messages to router-defined handlers.
 
-  The server supervises connection processes, applies middleware, manages
-  backpressure, and emits telemetry signals. Implementation details will be
-  developed incrementally; this module captures the intended public API.
+  The server supervises connection processes, applies middleware, and manages
+  the WebSocket lifecycle for bidirectional RPC communication.
+
+  ## Example
+
+      defmodule MyApp.Router do
+        use RpcEx.Router
+
+        call :ping do
+          {:ok, %{pong: args[:ping]}}
+        end
+      end
+
+      # In your application supervisor
+      children = [
+        {RpcEx.Server,
+         router: MyApp.Router,
+         port: 4000,
+         context: %{service: :my_app}}
+      ]
+
+      Supervisor.start_link(children, strategy: :one_for_one)
+
+  ## Options
+
+  - `:router` - (required) Module implementing RPC routes via `RpcEx.Router`
+  - `:port` - Port to listen on (default: 4444)
+  - `:scheme` - `:http` or `:https` (default: `:http`)
+  - `:context` - Custom context map passed to all handlers
+  - `:auth` - Authentication module `{module, opts}` implementing `RpcEx.Server.Auth`
+  - `:handshake` - Options for protocol handshake negotiation
+  - `:name` - Name for process registration
+
+  For additional Bandit configuration options, see `Bandit.start_link/1`.
+
+  ## Authentication
+
+  Configure authentication to validate clients during handshake:
+
+      RpcEx.Server.start_link(
+        router: MyApp.Router,
+        port: 4000,
+        auth: {MyApp.TokenAuth, []}
+      )
+
+  See `RpcEx.Server.Auth` for implementing custom authentication.
+
+  ## Bidirectional RPC
+
+  Server handlers can initiate calls to the connected client using the `peer`
+  handle injected into the handler context:
+
+      call :server_to_client do
+        {:ok, result, _meta} = RpcEx.Peer.call(context.peer, :client_method, args: %{foo: :bar})
+        {:ok, result}
+      end
   """
 
   alias Bandit
@@ -22,6 +75,7 @@ defmodule RpcEx.Server do
           | {:timeout, non_neg_integer()}
           | {:handshake, keyword()}
           | {:context, map()}
+          | {:auth, {module(), keyword()}}
           | {:telemetry_prefix, [atom()]}
           | {:url, String.t()}
           | {:connection_options, keyword()}
@@ -43,6 +97,7 @@ defmodule RpcEx.Server do
       router: router,
       handshake: Keyword.get(opts, :handshake, []),
       context: Keyword.get(opts, :context, %{}),
+      auth: Keyword.get(opts, :auth),
       websocket: Keyword.get(opts, :connection_options, [])
     ]
 

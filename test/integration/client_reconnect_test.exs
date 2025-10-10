@@ -16,24 +16,22 @@ defmodule RpcEx.Integration.ClientReconnectTest do
   test "client reconnects after server disconnect", %{port: port} do
     # Start server
     {:ok, _server_pid} =
-      start_supervised({Server,
-        router: RpcEx.Test.Integration.ServerRouter,
-        port: port
-      })
+      start_supervised({Server, router: RpcEx.Test.Integration.ServerRouter, port: port})
 
     # Start client with fast reconnect for testing
     {:ok, client_pid} =
-      start_supervised({Client,
-        url: "ws://localhost:#{port}/",
-        router: RpcEx.Test.Integration.ClientRouter,
-        reconnect: [
-          enabled: true,
-          initial_delay: 100,
-          max_delay: 1_000,
-          max_attempts: 5,
-          jitter: false
-        ]
-      })
+      start_supervised(
+        {Client,
+         url: "ws://localhost:#{port}/",
+         router: RpcEx.Test.Integration.ClientRouter,
+         reconnect: [
+           enabled: true,
+           initial_delay: 100,
+           max_delay: 1_000,
+           max_attempts: 5,
+           jitter: false
+         ]}
+      )
 
     # Wait for initial connection
     wait_for_ready(client_pid)
@@ -55,10 +53,7 @@ defmodule RpcEx.Integration.ClientReconnectTest do
 
     # Restart server
     {:ok, _new_server_pid} =
-      start_supervised({Server,
-        router: RpcEx.Test.Integration.ServerRouter,
-        port: port
-      })
+      start_supervised({Server, router: RpcEx.Test.Integration.ServerRouter, port: port})
 
     # Wait for reconnection (with retries)
     wait_for_ready(client_pid, 100)
@@ -75,17 +70,18 @@ defmodule RpcEx.Integration.ClientReconnectTest do
     # Start client with reconnect enabled but max 3 attempts
     # Don't start a server - connection will always fail
     {:ok, client_pid} =
-      start_supervised({Client,
-        url: "ws://localhost:#{port}/",
-        router: RpcEx.Test.Integration.ClientRouter,
-        reconnect: [
-          enabled: true,
-          initial_delay: 50,
-          max_delay: 200,
-          max_attempts: 3,
-          jitter: false
-        ]
-      })
+      start_supervised(
+        {Client,
+         url: "ws://localhost:#{port}/",
+         router: RpcEx.Test.Integration.ClientRouter,
+         reconnect: [
+           enabled: true,
+           initial_delay: 50,
+           max_delay: 200,
+           max_attempts: 3,
+           jitter: false
+         ]}
+      )
 
     # Monitor the client
     ref = Process.monitor(client_pid)
@@ -97,18 +93,16 @@ defmodule RpcEx.Integration.ClientReconnectTest do
   test "client with reconnect disabled stops on disconnect", %{port: port} do
     # Start server
     {:ok, _server_pid} =
-      start_supervised({Server,
-        router: RpcEx.Test.Integration.ServerRouter,
-        port: port
-      })
+      start_supervised({Server, router: RpcEx.Test.Integration.ServerRouter, port: port})
 
     # Start client with reconnect disabled
     {:ok, client_pid} =
-      start_supervised({Client,
-        url: "ws://localhost:#{port}/",
-        router: RpcEx.Test.Integration.ClientRouter,
-        reconnect: false
-      })
+      start_supervised(
+        {Client,
+         url: "ws://localhost:#{port}/",
+         router: RpcEx.Test.Integration.ClientRouter,
+         reconnect: false}
+      )
 
     # Wait for initial connection
     wait_for_ready(client_pid)

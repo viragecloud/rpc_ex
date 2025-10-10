@@ -13,6 +13,7 @@ defmodule RpcEx.Server.WebSocketHandler do
           negotiated?: boolean(),
           connection: Connection.t() | nil,
           context: map(),
+          auth: {module(), keyword()} | nil,
           pending_peer_calls: %{binary() => {reference(), pid()}}
         }
 
@@ -22,6 +23,7 @@ defmodule RpcEx.Server.WebSocketHandler do
       router: Map.fetch!(opts, :router),
       handshake_opts: Map.get(opts, :handshake_opts, []),
       context: Map.get(opts, :context, %{}),
+      auth: Map.get(opts, :auth),
       negotiated?: false,
       connection: nil,
       pending_peer_calls: %{}
@@ -100,37 +102,56 @@ defmodule RpcEx.Server.WebSocketHandler do
   defp negotiate(%{router: router} = state, payload) do
     local = Handshake.build(state.handshake_opts || [])
 
-    case Handshake.negotiate(local, payload) do
-      {:ok, session} ->
-        # Create peer handle for bidirectional RPC
-        peer = Peer.new(handler_pid: self(), timeout: 5_000)
+    with {:ok, session} <- Handshake.negotiate(local, payload),
+         {:ok, auth_context} <- authenticate(state.auth, payload) do
+      # Create peer handle for bidirectional RPC
+      peer = Peer.new(handler_pid: self(), timeout: 5_000)
 
-        # Inject peer into context so handlers can call back
-        context =
-          state
-          |> Map.get(:context, %{})
-          |> Map.put(:peer, peer)
+      # Merge base context, auth context, and peer
+      context =
+        state
+        |> Map.get(:context, %{})
+        |> Map.merge(auth_context)
+        |> Map.put(:peer, peer)
 
-        connection =
-          Connection.new(
-            router: router,
-            session: session,
-            context: context
-          )
+      connection =
+        Connection.new(
+          router: router,
+          session: session,
+          context: context
+        )
 
-        reply =
-          Frame.new(:welcome, %{
-            protocol_version: session.protocol_version,
-            compression: session.compression,
-            encoding: session.encoding,
-            capabilities: session.local_capabilities,
-            meta: session.meta
-          })
+      reply =
+        Frame.new(:welcome, %{
+          protocol_version: session.protocol_version,
+          compression: session.compression,
+          encoding: session.encoding,
+          capabilities: session.local_capabilities,
+          meta: session.meta
+        })
 
-        {:ok, reply, %{state | negotiated?: true, connection: connection}}
+      {:ok, reply, %{state | negotiated?: true, connection: connection}}
+    end
+  end
+
+  defp authenticate(nil, _payload), do: {:ok, %{}}
+
+  defp authenticate({auth_module, auth_opts}, payload) do
+    # Payload has atom keys, meta has string keys (from client)
+    credentials = get_in(payload, [:meta, "auth"])
+
+    case auth_module.authenticate(credentials, auth_opts) do
+      {:ok, context} when is_map(context) ->
+        {:ok, context}
+
+      {:error, reason, detail} ->
+        {:error, {:authentication_failed, reason, detail}}
 
       {:error, reason} ->
-        {:error, reason}
+        {:error, {:authentication_failed, reason}}
+
+      other ->
+        {:error, {:invalid_auth_response, other}}
     end
   end
 

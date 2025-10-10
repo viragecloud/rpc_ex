@@ -5,6 +5,50 @@ defmodule RpcEx.Router.Middleware do
   Middleware modules can intercept RPC requests before and after handler
   execution to implement cross-cutting concerns such as authentication,
   tracing, instrumentation, or payload shaping.
+
+  ## Example
+
+      defmodule MyApp.AuthMiddleware do
+        @behaviour RpcEx.Router.Middleware
+
+        def before(_kind, _route, args, context, opts) do
+          required_role = Keyword.get(opts, :role)
+
+          if authorized?(context, required_role) do
+            {:cont, context}
+          else
+            {:halt, {:error, :unauthorized}, context}
+          end
+        end
+
+        def after_handle(_kind, _route, response, context, _opts) do
+          # Log successful authorization
+          Logger.debug("Request completed for user: \#{context.user_id}")
+          {:cont, response, context}
+        end
+
+        defp authorized?(%{user: user}, role) do
+          role in user.roles
+        end
+      end
+
+      # Use in router
+      defmodule MyApp.Router do
+        use RpcEx.Router
+
+        middleware MyApp.AuthMiddleware, role: :admin
+
+        call :delete_user do
+          # Only executed if user has :admin role
+          {:ok, :deleted}
+        end
+      end
+
+  ## Middleware Chain
+
+  Multiple middleware modules are executed in the order they are declared.
+  The `before/5` callbacks execute top-down, and `after_handle/5` callbacks
+  execute bottom-up (like a stack).
   """
 
   @typedoc "The stage at which middleware is invoked."
