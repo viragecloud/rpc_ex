@@ -4,7 +4,8 @@
       "Bash(mix test:*)",
       "Bash(mix docs:*)",
       "Bash(MIX_ENV=test mix test --cover)",
-      "Bash(MIX_ENV=test mix test --cover --include integration)"
+      "Bash(MIX_ENV=test mix test --cover --include integration)",
+      "Bash(mix deps.get:*)"
     ],
     "deny": [],
     "ask": []

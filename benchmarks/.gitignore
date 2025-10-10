@@ -1,0 +1,6 @@
+# Benchmark result files
+*.txt
+results/
+
+# Compiled beam files
+*.beam

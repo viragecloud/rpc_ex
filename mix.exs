@@ -44,7 +44,8 @@ defmodule RpcEx.MixProject do
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev], runtime: false},
       {:ex_doc, "~> 0.31", only: :dev, runtime: false},
-      {:stream_data, "~> 0.6", only: :test}
+      {:stream_data, "~> 0.6", only: :test},
+      {:benchee, "~> 1.3", only: :dev, runtime: false}
     ]
   end
 
