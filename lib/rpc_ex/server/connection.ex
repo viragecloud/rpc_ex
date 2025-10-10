@@ -37,11 +37,20 @@ defmodule RpcEx.Server.Connection do
           {:reply, Frame.t(), t()}
           | {:push, Frame.t(), t()}
           | {:noreply, t()}
+          | {:async, t()}
   def handle_frame(%Frame{type: :call, payload: payload}, state) do
-    {action, new_ctx} =
-      Dispatcher.dispatch_call(state.router, payload, state.context, state.session)
+    # Spawn handler in a task to avoid blocking the WebSocket process
+    # This allows bidirectional RPC where handlers can call back to the peer
+    caller = self()
 
-    wrap(action, %{state | context: new_ctx})
+    Task.start(fn ->
+      {action, new_ctx} =
+        Dispatcher.dispatch_call(state.router, payload, state.context, state.session)
+
+      send(caller, {:handler_result, :call, action, new_ctx})
+    end)
+
+    {:async, state}
   end
 
   def handle_frame(%Frame{type: :cast, payload: payload}, state) do

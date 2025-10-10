@@ -116,9 +116,14 @@ end
     meta: %{important: true}
   )
 
-# async call returns reference for later await
-ref = RpcEx.Client.call_async(MyApp.RPCClient, :heavy_job, args: %{payload: data})
-{:ok, result} = RpcEx.Client.await(ref, 15_000)
+# concurrent calls using standard Elixir Task API
+tasks = [
+  Task.async(fn -> RpcEx.Client.call(MyApp.RPCClient, :get_user, args: %{id: 1}) end),
+  Task.async(fn -> RpcEx.Client.call(MyApp.RPCClient, :get_user, args: %{id: 2}) end),
+  Task.async(fn -> RpcEx.Client.call(MyApp.RPCClient, :get_user, args: %{id: 3}) end)
+]
+
+results = Task.await_many(tasks, 5_000)
 ```
 
 ## Discovering Available Routes
@@ -170,7 +175,7 @@ end
 ```
 
 - Remote errors surface as tagged tuples distinguishing local failures (`:timeout`, `:disconnected`) from remote handler errors (`{:remote, reason, detail}`).
-- Library should provide hooks for custom retry strategies (`RpcEx.Client.with_retry/2`).
+- Retry strategies can be implemented using standard Elixir patterns (e.g., recursive functions with exponential backoff, libraries like `Retry`).
 
 ## Supervision & Shutdown
 

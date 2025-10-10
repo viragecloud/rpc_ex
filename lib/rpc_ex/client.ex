@@ -22,6 +22,10 @@ defmodule RpcEx.Client do
   @type option ::
           {:name, GenServer.name()}
           | {:url, String.t()}
+          | {:scheme, :http | :https}
+          | {:host, String.t()}
+          | {:port, :inet.port_number()}
+          | {:path, String.t()}
           | {:router, module()}
           | {:timeout, non_neg_integer()}
           | {:handshake, keyword()}
@@ -38,6 +42,29 @@ defmodule RpcEx.Client do
   @typedoc "Opaque reference for async call tracking."
   @type call_ref :: binary()
 
+  defmodule State do
+    @moduledoc false
+    defstruct conn: nil,
+              websocket: nil,
+              request_ref: nil,
+              status: nil,
+              headers: nil,
+              connection_status: :connecting,
+              router: nil,
+              connection: nil,
+              pending: %{},
+              timeout: 5_000,
+              handshake: nil,
+              handshake_payload: nil,
+              scheme: :http,
+              host: "localhost",
+              port: 80,
+              path: "/",
+              transport_opts: [],
+              websocket_opts: [],
+              hello_sent?: false
+  end
+
   ## Public API
 
   @doc """
@@ -45,7 +72,7 @@ defmodule RpcEx.Client do
   """
   @spec start_link([option()]) :: GenServer.on_start()
   def start_link(opts) do
-    name = Keyword.get(opts, :name, __MODULE__)
+    name = Keyword.get(opts, :name)
     GenServer.start_link(__MODULE__, opts, name: name)
   end
 
@@ -93,7 +120,6 @@ defmodule RpcEx.Client do
 
   @impl GenServer
   def init(opts) do
-    url = Keyword.fetch!(opts, :url)
     router = Keyword.get(opts, :router)
     handshake_opts = Keyword.get(opts, :handshake, [])
     timeout = Keyword.get(opts, :timeout, 5_000)
@@ -101,11 +127,7 @@ defmodule RpcEx.Client do
     transport_opts = Keyword.get(opts, :transport_opts, [])
     websocket_opts = Keyword.get(opts, :websocket_opts, compress: false)
 
-    uri = URI.parse(url)
-    scheme = normalize_scheme(uri.scheme)
-    host = uri.host || raise ArgumentError, "url must include host"
-    port = uri.port || default_port(scheme)
-    path = normalize_path(uri.path, uri.query)
+    {scheme, host, port, path} = connection_target(opts)
 
     local_handshake = Handshake.build(handshake_opts)
 
@@ -114,32 +136,19 @@ defmodule RpcEx.Client do
       |> Map.from_struct()
       |> Map.put(:meta, Map.get(local_handshake, :meta, %{}))
 
-    state = %{
-      conn: nil,
-      websocket: nil,
-      request_ref: nil,
-      status: :connecting,
+    state = %State{
       router: router,
       connection: Connection.new(router: router, session: %{}, context: context),
-      pending: %{},
       timeout: timeout,
-      uri: uri,
+      handshake: local_handshake,
+      handshake_payload: handshake_payload,
       scheme: scheme,
       host: host,
       port: port,
       path: path,
       transport_opts: transport_opts,
       websocket_opts: websocket_opts,
-      local_handshake_struct: local_handshake,
-      local_handshake_payload: handshake_payload,
-      telemetry_prefix: Keyword.get(opts, :telemetry_prefix, [:rpc_ex, :client]),
-      session: %{},
-      reconnect: Keyword.get(opts, :reconnect, []),
-      buffer: %{},
-      awaiting_welcome?: false,
-      upgrade_status: nil,
-      upgrade_headers: nil,
-      upgrade_done: false
+      connection_status: :connecting
     }
 
     {:ok, state, {:continue, :connect}}
@@ -147,17 +156,37 @@ defmodule RpcEx.Client do
 
   @impl GenServer
   def handle_continue(:connect, state) do
-    case establish_connection(state) do
-      {:ok, new_state} ->
-        {:noreply, new_state}
+    http_scheme = transport_scheme(state.scheme)
+    ws_scheme = ws_scheme(state.scheme)
 
-      {:error, reason} ->
-        {:stop, reason, state}
+    case HTTP.connect(http_scheme, state.host, state.port, state.transport_opts) do
+      {:ok, conn} ->
+        case WebSocket.upgrade(
+               ws_scheme,
+               conn,
+               state.path,
+               [
+                 {"host", host_header(state.host, state.port, state.scheme)},
+                 {"sec-websocket-protocol", @subprotocol}
+               ],
+               Keyword.put_new(state.websocket_opts, :subprotocols, [@subprotocol])
+             ) do
+          {:ok, conn, ref} ->
+            {:noreply, %{state | conn: conn, request_ref: ref}}
+
+          {:error, conn, error} ->
+            Logger.error("WebSocket upgrade failed: #{inspect(error)}")
+            {:stop, error, %{state | conn: conn}}
+        end
+
+      {:error, error} ->
+        Logger.error("HTTP connection failed: #{inspect(error)}")
+        {:stop, error, state}
     end
   end
 
   @impl GenServer
-  def handle_call({:call, route, opts}, from, %{status: :ready} = state) do
+  def handle_call({:call, route, opts}, from, %{connection_status: :ready} = state) do
     args = Keyword.get(opts, :args, %{})
     timeout = Keyword.get(opts, :timeout, state.timeout)
     meta = Keyword.get(opts, :meta)
@@ -171,15 +200,18 @@ defmodule RpcEx.Client do
       meta: meta
     }
 
-    with {:ok, state} <- send_frame(Frame.new(:call, payload), state) do
-      timer =
-        if timeout && timeout != :infinity do
-          Process.send_after(self(), {:pending_timeout, msg_id}, timeout)
-        end
+    case send_frame(Frame.new(:call, payload), state) do
+      {:ok, state} ->
+        timer =
+          cond do
+            timeout == :infinity -> nil
+            timeout -> Process.send_after(self(), {:pending_timeout, msg_id}, timeout)
+            true -> nil
+          end
 
-      pending = Map.put(state.pending, msg_id, %{from: from, timer: timer, type: :call})
-      {:noreply, %{state | pending: pending}}
-    else
+        pending = Map.put(state.pending, msg_id, %{from: from, timer: timer, type: :call})
+        {:noreply, %{state | pending: pending}}
+
       {:error, reason, state} ->
         {:reply, {:error, reason}, state}
     end
@@ -189,7 +221,7 @@ defmodule RpcEx.Client do
     {:reply, {:error, :not_connected}, state}
   end
 
-  def handle_call({:cast, route, opts}, _from, %{status: :ready} = state) do
+  def handle_call({:cast, route, opts}, _from, %{connection_status: :ready} = state) do
     args = Keyword.get(opts, :args, %{})
     meta = Keyword.get(opts, :meta)
 
@@ -205,15 +237,20 @@ defmodule RpcEx.Client do
     end
   end
 
-  def handle_call({:discover, opts}, from, %{status: :ready} = state) do
+  def handle_call({:cast, _route, _opts}, _from, state) do
+    {:reply, {:error, :not_connected}, state}
+  end
+
+  def handle_call({:discover, opts}, from, %{connection_status: :ready} = state) do
     scope = Keyword.get(opts, :scope, :all)
     msg_id = generate_id()
-    payload = %{msg_id: msg_id, scope: scope}
+    payload = %{msg_id: msg_id, scope: scope, meta: %{}}
 
-    with {:ok, state} <- send_frame(Frame.new(:discover, payload), state) do
-      pending = Map.put(state.pending, msg_id, %{from: from, timer: nil, type: :discover})
-      {:noreply, %{state | pending: pending}}
-    else
+    case send_frame(Frame.new(:discover, payload), state) do
+      {:ok, state} ->
+        pending = Map.put(state.pending, msg_id, %{from: from, timer: nil, type: :discover})
+        {:noreply, %{state | pending: pending}}
+
       {:error, reason, state} ->
         {:reply, {:error, reason}, state}
     end
@@ -223,43 +260,40 @@ defmodule RpcEx.Client do
     {:reply, {:error, :not_connected}, state}
   end
 
-  def handle_call({:cast, _route, _opts}, _from, state) do
-    {:reply, {:error, :not_connected}, state}
-  end
-
   @impl GenServer
   def handle_info({:pending_timeout, msg_id}, state) do
     case Map.pop(state.pending, msg_id) do
       {nil, _pending} ->
         {:noreply, state}
 
-      {%{from: from}, pending} ->
+      {%{from: from, timer: timer}, pending} ->
+        if timer, do: Process.cancel_timer(timer)
         GenServer.reply(from, {:error, :timeout})
         {:noreply, %{state | pending: pending}}
     end
   end
 
   @impl GenServer
-  def handle_info(_message, %{conn: nil} = state) do
-    {:noreply, state}
-  end
-
-  @impl GenServer
-  def handle_info(message, state) do
+  def handle_info(message, %{conn: %{socket: socket}} = state)
+      when is_tuple(message) and
+             elem(message, 0) in [:tcp, :ssl, :tcp_closed, :ssl_closed, :tcp_error, :ssl_error] and
+             elem(message, 1) == socket do
     case WebSocket.stream(state.conn, message) do
       {:ok, conn, responses} ->
-        handle_responses(responses, %{state | conn: conn})
+        state = %{state | conn: conn}
+        process_responses(responses, state)
 
-      {:error, conn, reason, responses} ->
-        Logger.error("RPC client connection error: #{inspect(reason)} responses=#{inspect(responses)}")
-        {:stop, {:error, reason}, %{state | conn: conn}}
+      {:error, conn, error, _responses} ->
+        Logger.error("WebSocket stream error: #{inspect(error)}")
+        {:stop, {:error, error}, %{state | conn: conn}}
 
       :unknown ->
         {:noreply, state}
     end
-  catch
-    kind, reason ->
-      {:stop, {kind, reason}, state}
+  end
+
+  def handle_info(_message, state) do
+    {:noreply, state}
   end
 
   @impl GenServer
@@ -276,196 +310,223 @@ defmodule RpcEx.Client do
     :ok
   end
 
-  ## Internal helpers
+  ## Internal helpers - Response Processing
 
-  defp establish_connection(state) do
-    with {:ok, conn} <- HTTP.connect(state.scheme, state.host, state.port, state.transport_opts),
-         {:ok, conn, ref} <-
-           WebSocket.upgrade(
-             ws_scheme(state.scheme),
-             conn,
-             state.path,
-             [
-               {"host", host_header(state.host, state.port, state.scheme)},
-               {"sec-websocket-protocol", @subprotocol}
-             ],
-             Keyword.put_new(state.websocket_opts, :subprotocols, [@subprotocol])
-           ) do
-      {:ok,
-       %{
-         state
-         | conn: conn,
-           request_ref: ref,
-           status: :awaiting_upgrade
-       }}
-    else
-      {:error, reason} ->
-        {:error, reason}
-    end
+  defp process_responses(responses, state) do
+    Enum.reduce(responses, {:noreply, state}, fn response, {:noreply, state} ->
+      process_response(response, state)
+    end)
   end
 
-  defp handle_responses(responses, state) do
-    if state.status == :awaiting_upgrade do
-      Logger.debug("upgrade responses: #{inspect(responses)}")
-    end
-    responses
-    |> Enum.reduce_while({:noreply, state}, fn
-      {:status, ref, status}, {:noreply, state} when ref == state.request_ref ->
-        {:cont, {:noreply, %{state | upgrade_status: status}}}
+  defp process_response({:status, ref, status}, %{request_ref: ref} = state) do
+    {:noreply, %{state | status: status}}
+  end
 
-      {:headers, ref, headers}, {:noreply, state} when ref == state.request_ref ->
-        {:cont, {:noreply, %{state | upgrade_headers: headers}}}
+  defp process_response({:headers, ref, headers}, %{request_ref: ref} = state) do
+    case WebSocket.new(state.conn, ref, state.status || 101, headers) do
+      {:ok, conn, websocket} ->
+        state = %{
+          state
+          | conn: conn,
+            websocket: websocket,
+            status: nil,
+            headers: nil,
+            connection_status: :awaiting_welcome
+        }
 
-      {:data, ref, data}, {:noreply, %{websocket: websocket} = state}
-      when ref == state.request_ref ->
-        case WebSocket.stream(websocket, data) do
-          {:ok, websocket, frames} ->
-            state = %{state | websocket: websocket}
+        # Send hello frame immediately after upgrade completes
+        case send_frame(Frame.new(:hello, state.handshake_payload), state) do
+          {:ok, state} ->
+            {:noreply, %{state | hello_sent?: true}}
 
-            case handle_ws_frames(frames, state) do
-              {:ok, new_state} -> {:cont, {:noreply, new_state}}
-              {:stop, reason, new_state} -> {:halt, {:stop, reason, new_state}}
-            end
-
-          {:error, websocket, reason} ->
-            {:halt, {:stop, reason, %{state | websocket: websocket}}}
+          {:error, reason, state} ->
+            Logger.error("Failed to send hello: #{inspect(reason)}")
+            {:stop, reason, state}
         end
 
-      {:done, ref}, {:noreply, state} when ref == state.request_ref ->
-        {:cont, {:noreply, %{state | upgrade_done: true}}}
-
-      _response, {:noreply, state} ->
-        {:cont, {:noreply, state}}
-    end)
-    |> maybe_finalize_upgrade()
-    |> normalize_response()
-  end
-
-  defp handle_ws_frames(frames, state) do
-    Enum.reduce_while(frames, {:ok, state}, fn frame, {:ok, acc_state} ->
-      case frame do
-        {:binary, data} ->
-          handle_binary_frame(data, acc_state)
-
-        {:text, _data} ->
-          {:halt, {:stop, :unexpected_text_frame, acc_state}}
-
-        {:ping, data} ->
-          case send_ws_frame({:pong, data}, acc_state) do
-            {:ok, new_state} -> {:cont, {:ok, new_state}}
-            {:error, reason, new_state} -> {:halt, {:stop, reason, new_state}}
-          end
-
-        {:close, code, data} ->
-          {:halt, {:stop, {:remote_close, {code, data}}, acc_state}}
-
-        _ ->
-          {:cont, {:ok, acc_state}}
-      end
-    end)
-  end
-
-  defp handle_binary_frame(data, state) do
-    case Frame.decode(data) do
-      {:ok, %Frame{type: :welcome, payload: payload}} ->
-        handle_welcome(payload, state)
-
-      {:ok, %Frame{type: :reply, payload: payload}} ->
-        {:ok, handle_reply(payload, state)}
-
-      {:ok, %Frame{type: :error, payload: payload}} ->
-        {:ok, handle_error_reply(payload, state)}
-
-      {:ok, %Frame{type: :discover_reply, payload: payload}} ->
-        {:ok, handle_discover_reply(payload, state)}
-
-      {:ok, %Frame{type: type} = frame} when type in [:call, :cast, :discover] ->
-        handle_inbound_rpc(frame, state)
-
-      {:ok, %Frame{type: :notify, payload: payload}} ->
-        Logger.debug("received notify #{inspect(payload)}")
-        {:ok, state}
-
-      {:error, reason} ->
-        {:halt, {:stop, {:decode_error, reason}, state}}
+      {:error, conn, error} ->
+        Logger.error("WebSocket.new failed: #{inspect(error)}")
+        {:stop, error, %{state | conn: conn}}
     end
   end
 
-  defp handle_welcome(payload, state) do
-    case Handshake.negotiate(state.local_handshake_struct, payload) do
+  defp process_response({:data, ref, _data}, %{request_ref: ref, websocket: nil} = state) do
+    # Skip data if websocket not ready yet
+    {:noreply, state}
+  end
+
+  defp process_response({:data, ref, data}, %{request_ref: ref, websocket: websocket} = state) do
+    case WebSocket.decode(websocket, data) do
+      {:ok, websocket, frames} ->
+        state = %{state | websocket: websocket}
+        handle_frames(frames, state)
+
+      {:error, websocket, error} ->
+        Logger.error("WebSocket decode error: #{inspect(error)}")
+        {:noreply, %{state | websocket: websocket}}
+    end
+  end
+
+  defp process_response({:done, ref}, %{request_ref: ref} = state) do
+    {:noreply, state}
+  end
+
+  defp process_response(_response, state) do
+    {:noreply, state}
+  end
+
+  ## Frame Handling
+
+  defp handle_frames(frames, state) do
+    Enum.reduce(frames, {:noreply, state}, fn frame, {:noreply, state} ->
+      handle_frame(frame, state)
+    end)
+  end
+
+  defp handle_frame({:close, _code, _reason}, state) do
+    {:stop, :normal, state}
+  end
+
+  defp handle_frame({:ping, data}, state) do
+    case send_ws_frame({:pong, data}, state) do
+      {:ok, state} -> {:noreply, state}
+      {:error, reason, state} -> {:stop, reason, state}
+    end
+  end
+
+  defp handle_frame({:pong, _data}, state) do
+    {:noreply, state}
+  end
+
+  defp handle_frame({:binary, data}, state) do
+    case Frame.decode(data) do
+      {:ok, frame} ->
+        handle_rpc_frame(frame, state)
+
+      {:error, reason} ->
+        Logger.error("Failed to decode frame: #{inspect(reason)}")
+        {:noreply, state}
+    end
+  end
+
+  defp handle_frame({:text, _data}, state) do
+    Logger.warning("Received unexpected text frame")
+    {:noreply, state}
+  end
+
+  defp handle_frame(_frame, state) do
+    {:noreply, state}
+  end
+
+  ## RPC Frame Handling
+
+  defp handle_rpc_frame(%Frame{type: :welcome, payload: payload}, state) do
+    case Handshake.negotiate(state.handshake, payload) do
       {:ok, session} ->
         connection =
           state.connection
           |> Connection.put_router(state.router)
           |> Map.replace!(:session, session)
 
-        {:ok,
+        {:noreply,
          %{
            state
-           | status: :ready,
-             awaiting_welcome?: false,
-             session: session,
+           | connection_status: :ready,
              connection: connection
          }}
 
       {:error, reason} ->
-        {:halt, {:stop, {:handshake_failed, reason}, state}}
+        Logger.error("Handshake negotiation failed: #{inspect(reason)}")
+        {:stop, {:handshake_failed, reason}, state}
     end
   end
 
-  defp handle_reply(%{msg_id: msg_id} = payload, state) do
-    with {%{from: from, timer: timer}, pending} <- Map.pop(state.pending, msg_id) do
-      if timer, do: Process.cancel_timer(timer)
-      result = Map.get(payload, :result)
-      meta = Map.get(payload, :meta, %{})
-      GenServer.reply(from, {:ok, result, meta})
-      %{state | pending: pending}
-    else
-      _ -> state
-    end
+  defp handle_rpc_frame(%Frame{type: :reply, payload: payload}, state) do
+    {:noreply, handle_reply(payload, state)}
   end
 
-  defp handle_error_reply(%{msg_id: msg_id} = payload, state) do
-    with {%{from: from, timer: timer}, pending} <- Map.pop(state.pending, msg_id) do
-      if timer, do: Process.cancel_timer(timer)
-      reason = Map.get(payload, :reason, :unknown)
-      detail = Map.get(payload, :detail)
-      GenServer.reply(from, {:error, {reason, detail}})
-      %{state | pending: pending}
-    else
-      _ -> state
-    end
+  defp handle_rpc_frame(%Frame{type: :error, payload: payload}, state) do
+    {:noreply, handle_error_reply(payload, state)}
   end
 
-  defp handle_discover_reply(%{msg_id: msg_id} = payload, state) do
-    with {%{from: from}, pending} <- Map.pop(state.pending, msg_id) do
-      entries = Map.get(payload, :entries, [])
-      meta = Map.get(payload, :meta, %{})
-      GenServer.reply(from, {:ok, entries, meta})
-      %{state | pending: pending}
-    else
-      _ -> state
-    end
+  defp handle_rpc_frame(%Frame{type: :discover_reply, payload: payload}, state) do
+    {:noreply, handle_discover_reply(payload, state)}
   end
 
-  defp handle_inbound_rpc(frame, %{connection: connection} = state) do
-    case Connection.handle_frame(frame, connection) do
+  defp handle_rpc_frame(%Frame{type: type} = frame, state)
+       when type in [:call, :cast, :discover] do
+    case Connection.handle_frame(frame, state.connection) do
       {:reply, reply_frame, new_conn} ->
         case send_frame(reply_frame, %{state | connection: new_conn}) do
-          {:ok, new_state} -> {:ok, new_state}
-          {:error, reason, new_state} -> {:halt, {:stop, reason, new_state}}
+          {:ok, new_state} -> {:noreply, new_state}
+          {:error, reason, new_state} -> {:stop, reason, new_state}
         end
 
       {:push, push_frame, new_conn} ->
         case send_frame(push_frame, %{state | connection: new_conn}) do
-          {:ok, new_state} -> {:ok, new_state}
-          {:error, reason, new_state} -> {:halt, {:stop, reason, new_state}}
+          {:ok, new_state} -> {:noreply, new_state}
+          {:error, reason, new_state} -> {:stop, reason, new_state}
         end
 
       {:noreply, new_conn} ->
-        {:ok, %{state | connection: new_conn}}
+        {:noreply, %{state | connection: new_conn}}
     end
   end
+
+  defp handle_rpc_frame(%Frame{type: :notify, payload: payload}, state) do
+    Logger.debug("Received notify: #{inspect(payload)}")
+    {:noreply, state}
+  end
+
+  defp handle_rpc_frame(%Frame{type: type}, state) do
+    Logger.warning("Received unexpected frame type: #{inspect(type)}")
+    {:noreply, state}
+  end
+
+  ## Reply Handling
+
+  defp handle_reply(%{msg_id: msg_id} = payload, state) do
+    case Map.pop(state.pending, msg_id) do
+      {nil, _pending} ->
+        state
+
+      {%{from: from, timer: timer}, pending} ->
+        if timer, do: Process.cancel_timer(timer)
+        result = Map.get(payload, :result)
+        meta = Map.get(payload, :meta, %{})
+        GenServer.reply(from, {:ok, result, meta})
+        %{state | pending: pending}
+    end
+  end
+
+  defp handle_error_reply(%{msg_id: msg_id} = payload, state) do
+    case Map.pop(state.pending, msg_id) do
+      {nil, _pending} ->
+        state
+
+      {%{from: from, timer: timer}, pending} ->
+        if timer, do: Process.cancel_timer(timer)
+        reason = Map.get(payload, :reason, :unknown)
+        detail = Map.get(payload, :detail)
+        GenServer.reply(from, {:error, {reason, detail}})
+        %{state | pending: pending}
+    end
+  end
+
+  defp handle_discover_reply(%{msg_id: msg_id} = payload, state) do
+    case Map.pop(state.pending, msg_id) do
+      {nil, _pending} ->
+        state
+
+      {%{from: from}, pending} ->
+        entries = Map.get(payload, :entries, [])
+        meta = Map.get(payload, :meta, %{})
+        GenServer.reply(from, {:ok, entries, meta})
+        %{state | pending: pending}
+    end
+  end
+
+  ## Frame Sending
 
   defp send_frame(_frame, %{websocket: nil} = state) do
     {:error, :not_ready, state}
@@ -481,14 +542,40 @@ defmodule RpcEx.Client do
          {:ok, conn} <- WebSocket.stream_request_body(conn, ref, data) do
       {:ok, %{state | websocket: websocket, conn: conn}}
     else
-      {:error, websocket, reason} ->
+      {:error, websocket, reason} when is_struct(websocket, WebSocket) ->
         {:error, reason, %{state | websocket: websocket}}
 
-      {:error, conn, reason} ->
+      {:error, conn, reason} when is_struct(conn, HTTP) ->
         {:error, reason, %{state | conn: conn}}
+
+      {:error, reason} ->
+        {:error, reason, state}
     end
   end
 
+  ## Connection Target Parsing
+
+  defp connection_target(opts) do
+    case Keyword.fetch(opts, :url) do
+      {:ok, url} ->
+        uri = URI.parse(url)
+        scheme = normalize_scheme(uri.scheme)
+        host = uri.host || raise ArgumentError, "url must include host"
+        port = uri.port || default_port(scheme)
+        path = normalize_path(uri.path, uri.query)
+        {scheme, host, port, path}
+
+      :error ->
+        scheme = normalize_scheme(Keyword.get(opts, :scheme, :http))
+        host = Keyword.get(opts, :host, "localhost")
+        port = Keyword.get(opts, :port, default_port(scheme))
+        path = normalize_path(Keyword.get(opts, :path, "/"), nil)
+        {scheme, host, port, path}
+    end
+  end
+
+  defp normalize_scheme(:http), do: :http
+  defp normalize_scheme(:https), do: :https
   defp normalize_scheme("ws"), do: :http
   defp normalize_scheme("wss"), do: :https
   defp normalize_scheme("http"), do: :http
@@ -499,10 +586,11 @@ defmodule RpcEx.Client do
     raise ArgumentError, "unsupported scheme #{inspect(other)}"
   end
 
+  defp transport_scheme(:http), do: :http
+  defp transport_scheme(:https), do: :https
+
   defp ws_scheme(:https), do: :wss
   defp ws_scheme(:http), do: :ws
-  defp ws_scheme(:wss), do: :wss
-  defp ws_scheme(:ws), do: :ws
 
   defp normalize_path(nil, nil), do: "/"
   defp normalize_path("", nil), do: "/"
@@ -516,63 +604,6 @@ defmodule RpcEx.Client do
     default = default_port(scheme)
     if port == default, do: host, else: "#{host}:#{port}"
   end
-
-  defp complete_upgrade(%{status: :awaiting_upgrade, upgrade_headers: headers} = state, ref)
-       when is_list(headers) do
-    status = state.upgrade_status || 101
-
-    try do
-      case WebSocket.new(state.conn, ref, status, headers) do
-        {:ok, conn, websocket} ->
-          state = %{
-            state
-            | conn: conn,
-              websocket: websocket,
-              status: :awaiting_welcome,
-              awaiting_welcome?: true,
-              upgrade_status: nil,
-              upgrade_headers: nil,
-              upgrade_done: false
-          }
-
-          case send_frame(Frame.new(:hello, state.local_handshake_payload), state) do
-            {:ok, new_state} -> {:ok, new_state}
-            {:error, reason, new_state} -> {:error, reason, new_state}
-          end
-
-        {:error, conn, reason} ->
-          {:error, reason, %{state | conn: conn}}
-      end
-    rescue
-      exception ->
-        Logger.error("Mint.WebSocket.new failed: #{inspect(exception)}")
-        {:error, exception, state}
-    end
-  end
-
-  defp complete_upgrade(state, _ref), do: {:ok, state}
-
-  defp maybe_finalize_upgrade({:noreply, state}) do
-    case complete_upgrade_if_ready(state) do
-      {:ok, new_state} -> {:noreply, new_state}
-      {:error, reason, new_state} -> {:stop, reason, new_state}
-    end
-  end
-
-  defp maybe_finalize_upgrade(other), do: other
-
-  defp complete_upgrade_if_ready(%{status: :awaiting_upgrade, upgrade_done: true} = state) do
-    Logger.debug("completing upgrade with headers=#{inspect(state.upgrade_headers)} status=#{inspect(state.upgrade_status)}")
-    case state.upgrade_headers do
-      headers when is_list(headers) -> complete_upgrade(state, state.request_ref)
-      _ -> {:ok, state}
-    end
-  end
-
-  defp complete_upgrade_if_ready(state), do: {:ok, state}
-
-  defp normalize_response({:stop, reason, state}), do: {:stop, reason, state}
-  defp normalize_response(other), do: other
 
   defp generate_id do
     :erlang.unique_integer([:positive, :monotonic])

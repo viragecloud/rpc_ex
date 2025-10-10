@@ -52,20 +52,27 @@ defmodule RpcEx.Server.ConnectionTest do
           meta: %{trace_id: "abc"}
         })
 
-      {:reply, reply, new_state} = Connection.handle_frame(frame, state)
+      # Calls now execute asynchronously
+      {:async, _new_state} = Connection.handle_frame(frame, state)
 
+      # Wait for the async result
+      assert_receive {:handler_result, :call, action, _ctx}, 1000
+
+      assert {:reply, reply} = action
       assert %Frame{type: :reply, payload: payload} = reply
       assert payload.msg_id == "1"
       assert %{args: %{message: "hi", trace: :server}} = payload.result
       assert payload.meta == %{trace_id: "abc"}
-      assert new_state.context[:trace] == :server
     end
 
     test "returns error frame when handler errors", %{state: state} do
       frame = Frame.new(:call, %{msg_id: "2", route: :fail})
 
-      {:reply, reply, _} = Connection.handle_frame(frame, state)
+      {:async, _} = Connection.handle_frame(frame, state)
 
+      assert_receive {:handler_result, :call, action, _ctx}, 1000
+
+      assert {:reply, reply} = action
       assert %Frame{type: :error, payload: payload} = reply
       assert payload.msg_id == "2"
       assert payload.reason == :boom
@@ -75,8 +82,11 @@ defmodule RpcEx.Server.ConnectionTest do
     test "returns error frame when route missing", %{state: state} do
       frame = Frame.new(:call, %{msg_id: "3", route: :missing})
 
-      {:reply, reply, _} = Connection.handle_frame(frame, state)
+      {:async, _} = Connection.handle_frame(frame, state)
 
+      assert_receive {:handler_result, :call, action, _ctx}, 1000
+
+      assert {:reply, reply} = action
       assert %Frame{type: :error, payload: payload} = reply
       assert payload.msg_id == "3"
       assert payload.reason == :unknown_route

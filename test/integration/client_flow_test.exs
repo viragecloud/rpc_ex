@@ -1,4 +1,4 @@
-defmodule RpcEx.Integration.RpcFlowTest do
+defmodule RpcEx.Integration.ClientFlowTest do
   use ExUnit.Case
 
   alias RpcEx.Client
@@ -32,13 +32,14 @@ defmodule RpcEx.Integration.RpcFlowTest do
   end
 
   test "client router receives server call", %{client: client} do
-    assert {:ok, _result, _meta} = Client.call(client, :server_to_client, args: %{hello: :world})
+    assert {:ok, _result, _meta} =
+             Client.call(client, :server_to_client, args: %{hello: :world})
 
     # The middleware adds trace: :client to the args
     assert {:client_call, %{trace: :client, hello: :world}} in RpcEx.Test.Integration.Tracker.drain()
   end
 
-  test "discover returns routes", %{client: client} do
+  test "client discover returns routes", %{client: client} do
     {:ok, entries, _meta} = Client.discover(client)
     assert Enum.any?(entries, &(&1.route == :ping))
   end
@@ -49,7 +50,7 @@ defmodule RpcEx.Integration.RpcFlowTest do
 
   defp wait_for_ready(client, attempts) do
     case :sys.get_state(client) do
-      %{status: :ready} -> :ok
+      %{connection_status: :ready} -> :ok
       _ ->
         Process.sleep(50)
         wait_for_ready(client, attempts - 1)

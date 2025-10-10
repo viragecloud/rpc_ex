@@ -7,7 +7,7 @@ defmodule RpcEx.Test.Integration.ClientRouter do
     _ = context
     _ = opts
     RpcEx.Test.Integration.Tracker.record({:client_call, args})
-    {:reply, :client_ack}
+    {:ok, :client_ack}
   end
 
   cast :server_cast do

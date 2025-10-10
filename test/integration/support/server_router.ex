@@ -10,10 +10,14 @@ defmodule RpcEx.Test.Integration.ServerRouter do
   end
 
   call :server_to_client do
-    _ = context
     _ = opts
     RpcEx.Test.Integration.Tracker.record({:server_call, args})
-    {:ok, :ok}
+
+    # Server calls back to client's :server_to_client handler
+    peer = context.peer
+    {:ok, result, _meta} = RpcEx.Peer.call(peer, :server_to_client, args: args)
+
+    {:ok, result}
   end
 
   cast :notify do
