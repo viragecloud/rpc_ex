@@ -12,10 +12,13 @@ defmodule RpcEx.Router do
   defmacro __using__(opts \\ []) do
     quote do
       import RpcEx.Router,
-        only: [call: 1, call: 2, cast: 1, cast: 2, middleware: 1, middleware: 2]
+        only: [call: 2, call: 3, cast: 2, cast: 3, middleware: 1, middleware: 2]
 
-      Module.register_attribute(__MODULE__, :rpc_routes, accumulate: true)
-      Module.register_attribute(__MODULE__, :rpc_middlewares, accumulate: true)
+      Module.register_attribute(__MODULE__, :rpc_routes, accumulate: true, persist: true)
+      Module.register_attribute(__MODULE__, :rpc_middlewares, accumulate: true, persist: true)
+      Module.register_attribute(__MODULE__, :rpc_middleware_chain, persist: true)
+
+      Module.put_attribute(__MODULE__, :rpc_middleware_chain, [])
 
       @rpc_router_options unquote(opts)
 
@@ -34,14 +37,19 @@ defmodule RpcEx.Router do
   Declares middleware to be applied to subsequent routes.
   """
   defmacro middleware(module_or_tuple) do
+    expanded = Macro.expand(module_or_tuple, __CALLER__)
+    {value, _binding} = Code.eval_quoted(expanded, [], __CALLER__)
+    middleware = normalize_middleware(value)
+    register_middleware(__CALLER__.module, middleware)
+
     quote do
-      @rpc_middlewares RpcEx.Router.normalize_middleware(unquote(module_or_tuple))
+      :ok
     end
   end
 
   defmacro middleware(module, opts) do
     quote do
-      @rpc_middlewares {unquote(module), unquote(opts)}
+      unquote(__MODULE__).middleware({unquote(module), unquote(opts)})
     end
   end
 
@@ -49,22 +57,22 @@ defmodule RpcEx.Router do
   Defines a request/response RPC route.
   """
   defmacro call(name, do: block) do
-    define_route(:call, name, [], block)
+    define_route(:call, name, [], block, __CALLER__)
   end
 
   defmacro call(name, opts, do: block) when is_list(opts) do
-    define_route(:call, name, opts, block)
+    define_route(:call, name, opts, block, __CALLER__)
   end
 
   @doc """
   Defines a fire-and-forget RPC route.
   """
   defmacro cast(name, do: block) do
-    define_route(:cast, name, [], block)
+    define_route(:cast, name, [], block, __CALLER__)
   end
 
   defmacro cast(name, opts, do: block) when is_list(opts) do
-    define_route(:cast, name, opts, block)
+    define_route(:cast, name, opts, block, __CALLER__)
   end
 
   @doc false
@@ -79,6 +87,13 @@ defmodule RpcEx.Router do
     invalid middleware specification: #{inspect(other)}
     Expected a module or {module, opts} tuple.
     """
+  end
+
+  defp register_middleware(module, middleware) do
+    Module.put_attribute(module, :rpc_middlewares, middleware)
+
+    chain = Module.get_attribute(module, :rpc_middleware_chain) || []
+    Module.put_attribute(module, :rpc_middleware_chain, chain ++ [middleware])
   end
 
   @doc false
@@ -104,19 +119,20 @@ defmodule RpcEx.Router do
     end
   end
 
-  defp define_route(kind, name, opts, block) do
-    args_var = Macro.var(:args, nil)
-    context_var = Macro.var(:context, nil)
-    options_var = Macro.var(:opts, nil)
+  defp define_route(kind, name, opts, block, %Macro.Env{} = env) do
+    middlewares =
+      env.module
+      |> Module.get_attribute(:rpc_middleware_chain)
+      |> case do
+        nil -> []
+        list when is_list(list) -> list
+      end
 
     quote do
-      def __rpc_dispatch__(
-            unquote(kind),
-            unquote(name),
-            unquote(args_var),
-            unquote(context_var),
-            unquote(options_var)
-          ) do
+      def __rpc_dispatch__(unquote(kind), unquote(name), args, context, opts) do
+        var!(args) = args
+        var!(context) = context
+        var!(opts) = opts
         unquote(block)
       end
 
@@ -124,7 +140,8 @@ defmodule RpcEx.Router do
         name: unquote(name),
         kind: unquote(kind),
         handler: {__MODULE__, :__rpc_dispatch__, 5},
-        options: unquote(opts),
+        options: unquote(Macro.escape(opts)),
+        middlewares: unquote(Macro.escape(middlewares)),
         metadata: %{}
       }
 

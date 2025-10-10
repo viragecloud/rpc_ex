@@ -9,6 +9,7 @@ defmodule RpcEx.Reflection do
           route: RpcEx.route(),
           kind: Route.kind(),
           options: Route.options(),
+          middlewares: [RpcEx.Router.middleware()],
           metadata: map()
         }
 
@@ -28,6 +29,7 @@ defmodule RpcEx.Reflection do
       route: route.name,
       kind: route.kind,
       options: route.options,
+      middlewares: route.middlewares || [],
       metadata: route.metadata
     }
   end

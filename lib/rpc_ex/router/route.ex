@@ -7,7 +7,7 @@ defmodule RpcEx.Router.Route do
   """
 
   @enforce_keys [:name, :kind, :handler, :options]
-  defstruct [:name, :kind, :handler, :options, metadata: %{}]
+  defstruct [:name, :kind, :handler, :options, middlewares: [], metadata: %{}]
 
   @typedoc "The operation type supported by a route."
   @type kind :: :call | :cast
@@ -24,6 +24,7 @@ defmodule RpcEx.Router.Route do
           kind: kind(),
           handler: handler(),
           options: options(),
+          middlewares: [RpcEx.Router.middleware()] | nil,
           metadata: map()
         }
 end
