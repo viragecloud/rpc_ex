@@ -7,6 +7,7 @@ defmodule RpcEx.MixProject do
       version: "0.1.0",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
+      elixirc_paths: elixirc_paths(Mix.env()),
       deps: deps(),
       aliases: aliases(),
       docs: docs(),
@@ -29,6 +30,9 @@ defmodule RpcEx.MixProject do
   def cli do
     [preferred_envs: [check: :test]]
   end
+
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_), do: ["lib"]
 
   # Run "mix help deps" to learn about dependencies.
   defp deps do

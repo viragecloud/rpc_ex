@@ -96,6 +96,7 @@ defmodule RpcEx.Router.Executor do
     Enum.reduce_while(middlewares, {:ok, args, context, []}, fn middleware,
                                                                 {:ok, curr_args, curr_ctx, stack} ->
       {module, mw_opts} = middleware
+      _ = Code.ensure_loaded?(module)
       before_exported? = function_exported?(module, :before, 5)
       after_exported? = function_exported?(module, :after_handle, 5)
       stack_entry = {module, mw_opts}

@@ -45,7 +45,24 @@ defmodule RpcEx.Protocol.Handshake do
   @spec negotiate(t(), map()) ::
           {:ok, map()}
           | {:error, :unsupported_version | :unsupported_encoding | :rejected}
-  def negotiate(%__MODULE__{} = local, %{"protocol_version" => remote_version} = remote) do
+  def negotiate(%__MODULE__{} = local, remote) when is_map(remote) do
+    remote = normalize_keys(remote)
+
+    case remote do
+      %{"error" => _reason} ->
+        {:error, :rejected}
+
+      %{"protocol_version" => remote_version} ->
+        do_negotiate(local, remote, remote_version)
+
+      _ ->
+        {:error, :unsupported_version}
+    end
+  end
+
+  def negotiate(%__MODULE__{}, _other), do: {:error, :unsupported_version}
+
+  defp do_negotiate(local, remote, remote_version) do
     with true <- compatible_protocol?(local.protocol_version, remote_version),
          {:ok, compression} <-
            negotiate_compression(local.compression, Map.get(remote, "compression")),
@@ -69,10 +86,6 @@ defmodule RpcEx.Protocol.Handshake do
       {:error, reason} -> {:error, reason}
     end
   end
-
-  def negotiate(%__MODULE__{}, %{"error" => _reason}), do: {:error, :rejected}
-
-  def negotiate(%__MODULE__{}, _other), do: {:error, :unsupported_version}
 
   defp compatible_protocol?(local_version, remote_version) when local_version >= 1 do
     remote_version >= 1 and abs(local_version - remote_version) <= 1
@@ -100,5 +113,15 @@ defmodule RpcEx.Protocol.Handshake do
       true -> base ++ [:notify]
       false -> base
     end
+  end
+
+  defp normalize_keys(map) do
+    Enum.reduce(map, %{}, fn
+      {key, value}, acc when is_atom(key) ->
+        Map.put(acc, Atom.to_string(key), value)
+
+      {key, value}, acc ->
+        Map.put(acc, key, value)
+    end)
   end
 end

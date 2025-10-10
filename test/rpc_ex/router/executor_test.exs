@@ -3,39 +3,10 @@ defmodule RpcEx.Router.ExecutorTest do
 
   alias RpcEx.Router.Executor
 
-  defmodule TestMiddleware.Trace do
-    @behaviour RpcEx.Router.Middleware
-
-    def before(_kind, _route, args, context, opts) do
-      tag = Keyword.fetch!(opts, :tag)
-      new_args = Map.put(args, :trace, tag)
-      new_context = Map.put(context, :trace, tag)
-      {:replace, new_args, new_context}
-    end
-
-    def after_handle(_kind, _route, response, context, _opts) do
-      {:cont, {:post, response, context[:trace]}, context}
-    end
-  end
-
-  defmodule TestMiddleware.Halt do
-    @behaviour RpcEx.Router.Middleware
-
-    def before(_kind, _route, _args, context, opts) do
-      reason = Keyword.get(opts, :reason, :halted)
-      new_context = Map.put(context, :halted, true)
-      {:halt, {:halted, reason}, new_context}
-    end
-
-    def after_handle(_kind, _route, response, context, _opts) do
-      {:cont, {:after_halt, response}, Map.put(context, :after, true)}
-    end
-  end
-
   defmodule TestRouter do
     use RpcEx.Router
 
-    middleware TestMiddleware.Trace, tag: :foo
+    middleware RpcEx.Test.Middlewares.Trace, tag: :foo
 
     call :echo, timeout: 5_000 do
       _ = context
@@ -52,7 +23,7 @@ defmodule RpcEx.Router.ExecutorTest do
   defmodule HaltingRouter do
     use RpcEx.Router
 
-    middleware TestMiddleware.Halt, reason: :blocked
+    middleware RpcEx.Test.Middlewares.Halt, reason: :blocked
 
     call :restricted do
       _ = args
@@ -68,8 +39,7 @@ defmodule RpcEx.Router.ExecutorTest do
       args = %{message: "hi"}
       {:ok, result, ctx} = Executor.dispatch(TestRouter, :call, :echo, args, %{}, timeout: 1000)
 
-      assert {:post, {:ok, {%{message: "hi", trace: :foo}, %{trace: :foo}, [timeout: 1000]}},
-              :foo} = result
+      assert {:ok, {%{message: "hi", trace: :foo}, %{trace: :foo}, [timeout: 1000]}} = result
 
       assert ctx == %{trace: :foo}
     end
@@ -78,12 +48,19 @@ defmodule RpcEx.Router.ExecutorTest do
       args = %{value: 10}
       {:ok, result, ctx} = Executor.dispatch(TestRouter, :cast, :notify, args)
 
-      assert {:post, {:cast, %{value: 10, trace: :foo}}, :foo} = result
+      assert {:cast, %{value: 10, trace: :foo}} = result
       assert ctx == %{trace: :foo}
     end
 
     test "halts execution when middleware requests it" do
       args = %{}
+
+      routes = HaltingRouter.__rpc_routes__()
+
+      assert Enum.any?(routes, fn route ->
+               route.name == :restricted and
+                 route.middlewares == [{RpcEx.Test.Middlewares.Halt, [reason: :blocked]}]
+             end)
 
       assert {:halt, {:after_halt, {:halted, :blocked}}, %{after: true, halted: true}} =
                Executor.dispatch(HaltingRouter, :call, :restricted, args, %{})
