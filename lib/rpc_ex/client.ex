@@ -15,6 +15,7 @@ defmodule RpcEx.Client do
 
   alias Mint.{HTTP, WebSocket}
   alias RpcEx.Client.Connection
+  alias RpcEx.Peer
   alias RpcEx.Protocol.{Frame, Handshake}
 
   @subprotocol "rpc_ex.etf.v1"
@@ -54,6 +55,7 @@ defmodule RpcEx.Client do
               router: nil,
               connection: nil,
               pending: %{},
+              pending_peer_calls: %{},
               timeout: 5_000,
               handshake: nil,
               handshake_payload: nil,
@@ -309,6 +311,23 @@ defmodule RpcEx.Client do
     end
   end
 
+  def handle_info({:peer_call, ref, frame, from_pid}, state) do
+    %Frame{payload: %{msg_id: msg_id}} = frame
+    pending = Map.put(state.pending_peer_calls, msg_id, {ref, from_pid})
+
+    case send_frame(frame, %{state | pending_peer_calls: pending}) do
+      {:ok, new_state} -> {:noreply, new_state}
+      {:error, reason, new_state} -> handle_disconnect({:peer_call_failed, reason}, new_state)
+    end
+  end
+
+  def handle_info({:peer_cast, frame}, state) do
+    case send_frame(frame, state) do
+      {:ok, new_state} -> {:noreply, new_state}
+      {:error, reason, new_state} -> handle_disconnect({:peer_cast_failed, reason}, new_state)
+    end
+  end
+
   def handle_info(_message, state) do
     {:noreply, state}
   end
@@ -440,10 +459,19 @@ defmodule RpcEx.Client do
   defp handle_rpc_frame(%Frame{type: :welcome, payload: payload}, state) do
     case Handshake.negotiate(state.handshake, payload) do
       {:ok, session} ->
+        # Create peer handle for bidirectional RPC
+        peer = Peer.new(handler_pid: self(), timeout: 5_000)
+
+        # Inject peer into context so handlers can call back to server
+        context =
+          state.connection.context
+          |> Map.put(:peer, peer)
+
         connection =
           state.connection
           |> Connection.put_router(state.router)
           |> Map.replace!(:session, session)
+          |> Map.replace!(:context, context)
 
         # Successful connection - reset reconnect attempt counter
         Logger.info("Client connected and ready")
@@ -463,11 +491,27 @@ defmodule RpcEx.Client do
   end
 
   defp handle_rpc_frame(%Frame{type: :reply, payload: payload}, state) do
-    {:noreply, handle_reply(payload, state)}
+    # Check if this is a peer call response first
+    case handle_peer_response(:reply, payload, state) do
+      {:handled, new_state} ->
+        {:noreply, new_state}
+
+      :not_found ->
+        # Regular client-initiated call response
+        {:noreply, handle_reply(payload, state)}
+    end
   end
 
   defp handle_rpc_frame(%Frame{type: :error, payload: payload}, state) do
-    {:noreply, handle_error_reply(payload, state)}
+    # Check if this is a peer call response first
+    case handle_peer_response(:error, payload, state) do
+      {:handled, new_state} ->
+        {:noreply, new_state}
+
+      :not_found ->
+        # Regular client-initiated call error response
+        {:noreply, handle_error_reply(payload, state)}
+    end
   end
 
   defp handle_rpc_frame(%Frame{type: :discover_reply, payload: payload}, state) do
@@ -502,6 +546,36 @@ defmodule RpcEx.Client do
   defp handle_rpc_frame(%Frame{type: type}, state) do
     Logger.warning("Received unexpected frame type: #{inspect(type)}")
     {:noreply, state}
+  end
+
+  ## Peer Call Response Handling
+
+  defp handle_peer_response(:reply, %{msg_id: msg_id} = payload, state) do
+    %{result: result} = payload
+    meta = Map.get(payload, :meta, %{})
+
+    case Map.pop(state.pending_peer_calls, msg_id) do
+      {nil, _pending} ->
+        :not_found
+
+      {{ref, from_pid}, pending} ->
+        send(from_pid, {:peer_reply, ref, {:ok, result, meta}})
+        {:handled, %{state | pending_peer_calls: pending}}
+    end
+  end
+
+  defp handle_peer_response(:error, %{msg_id: msg_id} = payload, state) do
+    %{reason: reason} = payload
+    detail = Map.get(payload, :detail)
+
+    case Map.pop(state.pending_peer_calls, msg_id) do
+      {nil, _pending} ->
+        :not_found
+
+      {{ref, from_pid}, pending} ->
+        send(from_pid, {:peer_reply, ref, {:error, {reason, detail}}})
+        {:handled, %{state | pending_peer_calls: pending}}
+    end
   end
 
   ## Reply Handling

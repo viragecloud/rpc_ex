@@ -27,4 +27,12 @@ defmodule RpcEx.Test.Integration.ServerRouter do
     RpcEx.Test.Integration.Tracker.record({:server_cast, args})
     {:notify, %{event: :server_notify, payload: args}}
   end
+
+  call :slow_add do
+    _ = context
+    _ = opts
+    delay = args[:delay] || 100
+    Process.sleep(delay)
+    {:ok, %{sum: args[:a] + args[:b], delay: delay}}
+  end
 end
