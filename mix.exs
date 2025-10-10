@@ -26,6 +26,10 @@ defmodule RpcEx.MixProject do
     ]
   end
 
+  def cli do
+    [preferred_envs: [check: :test]]
+  end
+
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [

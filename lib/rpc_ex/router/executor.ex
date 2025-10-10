@@ -93,40 +93,61 @@ defmodule RpcEx.Router.Executor do
   end
 
   defp run_before(middlewares, kind, route_name, args, context) do
-    Enum.reduce_while(middlewares, {:ok, args, context, []}, fn {module, mw_opts},
+    Enum.reduce_while(middlewares, {:ok, args, context, []}, fn middleware,
                                                                 {:ok, curr_args, curr_ctx, stack} ->
+      {module, mw_opts} = middleware
       before_exported? = function_exported?(module, :before, 5)
       after_exported? = function_exported?(module, :after_handle, 5)
       stack_entry = {module, mw_opts}
       updated_stack = if after_exported?, do: [stack_entry | stack], else: stack
 
-      cond do
-        before_exported? ->
-          case module.before(kind, route_name, curr_args, curr_ctx, mw_opts) do
-            {:cont, new_ctx} when is_map(new_ctx) ->
-              {:cont, {:ok, curr_args, new_ctx, updated_stack}}
-
-            {:replace, new_args, new_ctx} when is_map(new_ctx) ->
-              {:cont, {:ok, new_args, new_ctx, updated_stack}}
-
-            {:halt, response} ->
-              {:halt, {:halt, response, curr_ctx, updated_stack}}
-
-            {:halt, response, new_ctx} when is_map(new_ctx) ->
-              {:halt, {:halt, response, new_ctx, updated_stack}}
-
-            other ->
-              raise ArgumentError,
-                    "invalid return from #{inspect(module)}.before/5: #{inspect(other)}"
-          end
-
-        after_exported? ->
-          {:cont, {:ok, curr_args, curr_ctx, updated_stack}}
-
-        true ->
-          {:cont, {:ok, curr_args, curr_ctx, stack}}
-      end
+      reduce_before_stage(
+        %{module: module, mw_opts: mw_opts, before?: before_exported?, after?: after_exported?},
+        %{
+          kind: kind,
+          route: route_name,
+          args: curr_args,
+          ctx: curr_ctx,
+          stack: stack,
+          updated_stack: updated_stack
+        }
+      )
     end)
+  end
+
+  defp reduce_before_stage(%{before?: true} = state, params) do
+    %{module: module, mw_opts: mw_opts} = state
+    %{kind: kind, route: route, args: args, ctx: ctx, updated_stack: updated_stack} = params
+
+    case module.before(kind, route, args, ctx, mw_opts) do
+      {:cont, new_ctx} when is_map(new_ctx) ->
+        {:cont, {:ok, args, new_ctx, updated_stack}}
+
+      {:replace, new_args, new_ctx} when is_map(new_ctx) ->
+        {:cont, {:ok, new_args, new_ctx, updated_stack}}
+
+      {:halt, response} ->
+        {:halt, {:halt, response, ctx, updated_stack}}
+
+      {:halt, response, new_ctx} when is_map(new_ctx) ->
+        {:halt, {:halt, response, new_ctx, updated_stack}}
+
+      other ->
+        raise ArgumentError,
+              "invalid return from #{inspect(module)}.before/5: #{inspect(other)}"
+    end
+  end
+
+  defp reduce_before_stage(%{before?: false, after?: true}, %{
+         args: args,
+         ctx: ctx,
+         updated_stack: updated_stack
+       }) do
+    {:cont, {:ok, args, ctx, updated_stack}}
+  end
+
+  defp reduce_before_stage(_state, %{args: args, ctx: ctx, stack: stack}) do
+    {:cont, {:ok, args, ctx, stack}}
   end
 
   defp run_after([], _kind, _route, result, context), do: {result, context}
