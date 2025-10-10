@@ -30,6 +30,7 @@ defmodule RpcEx.Client do
           | {:timeout, non_neg_integer()}
           | {:handshake, keyword()}
           | {:context, map()}
+          | {:reconnect, boolean() | keyword()}
           | {:telemetry_prefix, [atom()]}
           | {:transport_opts, keyword()}
           | {:websocket_opts, keyword()}
@@ -62,7 +63,10 @@ defmodule RpcEx.Client do
               path: "/",
               transport_opts: [],
               websocket_opts: [],
-              hello_sent?: false
+              hello_sent?: false,
+              reconnect_config: nil,
+              reconnect_attempt: 0,
+              reconnect_timer: nil
   end
 
   ## Public API
@@ -126,6 +130,7 @@ defmodule RpcEx.Client do
     context = Keyword.get(opts, :context, %{})
     transport_opts = Keyword.get(opts, :transport_opts, [])
     websocket_opts = Keyword.get(opts, :websocket_opts, compress: false)
+    reconnect_config = parse_reconnect_config(Keyword.get(opts, :reconnect, true))
 
     {scheme, host, port, path} = connection_target(opts)
 
@@ -148,6 +153,7 @@ defmodule RpcEx.Client do
       path: path,
       transport_opts: transport_opts,
       websocket_opts: websocket_opts,
+      reconnect_config: reconnect_config,
       connection_status: :connecting
     }
 
@@ -176,13 +182,19 @@ defmodule RpcEx.Client do
 
           {:error, conn, error} ->
             Logger.error("WebSocket upgrade failed: #{inspect(error)}")
-            {:stop, error, %{state | conn: conn}}
+            handle_disconnect({:upgrade_failed, error}, %{state | conn: conn})
         end
 
       {:error, error} ->
         Logger.error("HTTP connection failed: #{inspect(error)}")
-        {:stop, error, state}
+        handle_disconnect({:connection_failed, error}, state)
     end
+  end
+
+  @impl GenServer
+  def handle_continue(:reconnect, state) do
+    # Same as :connect but called during reconnection
+    handle_continue(:connect, state)
   end
 
   @impl GenServer
@@ -261,6 +273,11 @@ defmodule RpcEx.Client do
   end
 
   @impl GenServer
+  def handle_info(:reconnect, state) do
+    Logger.info("Attempting to reconnect...")
+    {:noreply, state, {:continue, :reconnect}}
+  end
+
   def handle_info({:pending_timeout, msg_id}, state) do
     case Map.pop(state.pending, msg_id) do
       {nil, _pending} ->
@@ -285,7 +302,7 @@ defmodule RpcEx.Client do
 
       {:error, conn, error, _responses} ->
         Logger.error("WebSocket stream error: #{inspect(error)}")
-        {:stop, {:error, error}, %{state | conn: conn}}
+        handle_disconnect({:stream_error, error}, %{state | conn: conn})
 
       :unknown ->
         {:noreply, state}
@@ -341,12 +358,12 @@ defmodule RpcEx.Client do
 
           {:error, reason, state} ->
             Logger.error("Failed to send hello: #{inspect(reason)}")
-            {:stop, reason, state}
+            handle_disconnect({:hello_failed, reason}, state)
         end
 
       {:error, conn, error} ->
         Logger.error("WebSocket.new failed: #{inspect(error)}")
-        {:stop, error, %{state | conn: conn}}
+        handle_disconnect({:websocket_new_failed, error}, %{state | conn: conn})
     end
   end
 
@@ -383,14 +400,14 @@ defmodule RpcEx.Client do
     end)
   end
 
-  defp handle_frame({:close, _code, _reason}, state) do
-    {:stop, :normal, state}
+  defp handle_frame({:close, code, reason}, state) do
+    handle_disconnect({:remote_close, {code, reason}}, state)
   end
 
   defp handle_frame({:ping, data}, state) do
     case send_ws_frame({:pong, data}, state) do
       {:ok, state} -> {:noreply, state}
-      {:error, reason, state} -> {:stop, reason, state}
+      {:error, reason, state} -> handle_disconnect({:pong_failed, reason}, state)
     end
   end
 
@@ -428,16 +445,20 @@ defmodule RpcEx.Client do
           |> Connection.put_router(state.router)
           |> Map.replace!(:session, session)
 
+        # Successful connection - reset reconnect attempt counter
+        Logger.info("Client connected and ready")
+
         {:noreply,
          %{
            state
            | connection_status: :ready,
-             connection: connection
+             connection: connection,
+             reconnect_attempt: 0
          }}
 
       {:error, reason} ->
         Logger.error("Handshake negotiation failed: #{inspect(reason)}")
-        {:stop, {:handshake_failed, reason}, state}
+        handle_disconnect({:handshake_failed, reason}, state)
     end
   end
 
@@ -459,13 +480,13 @@ defmodule RpcEx.Client do
       {:reply, reply_frame, new_conn} ->
         case send_frame(reply_frame, %{state | connection: new_conn}) do
           {:ok, new_state} -> {:noreply, new_state}
-          {:error, reason, new_state} -> {:stop, reason, new_state}
+          {:error, reason, new_state} -> handle_disconnect({:send_failed, reason}, new_state)
         end
 
       {:push, push_frame, new_conn} ->
         case send_frame(push_frame, %{state | connection: new_conn}) do
           {:ok, new_state} -> {:noreply, new_state}
-          {:error, reason, new_state} -> {:stop, reason, new_state}
+          {:error, reason, new_state} -> handle_disconnect({:send_failed, reason}, new_state)
         end
 
       {:noreply, new_conn} ->
@@ -608,5 +629,99 @@ defmodule RpcEx.Client do
   defp generate_id do
     :erlang.unique_integer([:positive, :monotonic])
     |> Integer.to_string(16)
+  end
+
+  ## Reconnection Logic
+
+  defp parse_reconnect_config(false), do: nil
+  defp parse_reconnect_config(nil), do: nil
+
+  defp parse_reconnect_config(true) do
+    %{
+      enabled: true,
+      strategy: :exponential,
+      initial_delay: 100,
+      max_delay: 30_000,
+      max_attempts: :infinity,
+      jitter: true
+    }
+  end
+
+  defp parse_reconnect_config(opts) when is_list(opts) do
+    %{
+      enabled: Keyword.get(opts, :enabled, true),
+      strategy: Keyword.get(opts, :strategy, :exponential),
+      initial_delay: Keyword.get(opts, :initial_delay, 100),
+      max_delay: Keyword.get(opts, :max_delay, 30_000),
+      max_attempts: Keyword.get(opts, :max_attempts, :infinity),
+      jitter: Keyword.get(opts, :jitter, true)
+    }
+  end
+
+  defp handle_disconnect(reason, state) do
+    Logger.warning("Client disconnected: #{inspect(reason)}")
+
+    # Fail all pending calls
+    state = fail_pending_calls(state, {:error, :disconnected})
+
+    # Clean up connection state
+    state = %{
+      state
+      | conn: nil,
+        websocket: nil,
+        request_ref: nil,
+        connection_status: :disconnected
+    }
+
+    case should_reconnect?(state) do
+      true ->
+        schedule_reconnect(state)
+
+      false ->
+        {:stop, reason, state}
+    end
+  end
+
+  defp should_reconnect?(%{reconnect_config: nil}), do: false
+  defp should_reconnect?(%{reconnect_config: %{enabled: false}}), do: false
+
+  defp should_reconnect?(%{reconnect_config: %{max_attempts: :infinity}}), do: true
+
+  defp should_reconnect?(%{reconnect_config: %{max_attempts: max}, reconnect_attempt: attempt}) do
+    attempt < max
+  end
+
+  defp schedule_reconnect(state) do
+    delay = calculate_backoff(state)
+    Logger.info("Scheduling reconnect attempt #{state.reconnect_attempt + 1} in #{delay}ms")
+
+    timer = Process.send_after(self(), :reconnect, delay)
+
+    {:noreply, %{state | reconnect_timer: timer, reconnect_attempt: state.reconnect_attempt + 1}}
+  end
+
+  defp calculate_backoff(%{reconnect_config: config, reconnect_attempt: attempt}) do
+    %{initial_delay: initial, max_delay: max, strategy: :exponential, jitter: add_jitter?} =
+      config
+
+    # Exponential backoff: initial * 2^attempt, capped at max
+    delay = min(initial * :math.pow(2, attempt), max) |> trunc()
+
+    # Add jitter (±25%) to prevent thundering herd
+    if add_jitter? do
+      jitter = trunc(delay * 0.25)
+      delay + :rand.uniform(jitter * 2) - jitter
+    else
+      delay
+    end
+  end
+
+  defp fail_pending_calls(%{pending: pending} = state, error) do
+    Enum.each(pending, fn {_msg_id, %{from: from, timer: timer}} ->
+      if timer, do: Process.cancel_timer(timer)
+      GenServer.reply(from, error)
+    end)
+
+    %{state | pending: %{}}
   end
 end
