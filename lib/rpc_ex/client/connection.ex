@@ -37,6 +37,10 @@ defmodule RpcEx.Client.Connection do
     %{state | router: router}
   end
 
+  def put_router(state, nil) do
+    state
+  end
+
   @doc """
   Handles an inbound frame emitted by the server.
   """

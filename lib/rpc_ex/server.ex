@@ -14,6 +14,7 @@ defmodule RpcEx.Server do
   @type option ::
           {:router, module()}
           | {:port, :inet.port_number()}
+          | {:scheme, :http | :https}
           | {:transport, :bandit | :cowboy}
           | {:compression, :enabled | :disabled}
           | {:discovery, boolean()}
@@ -24,8 +25,6 @@ defmodule RpcEx.Server do
           | {:telemetry_prefix, [atom()]}
           | {:url, String.t()}
           | {:connection_options, keyword()}
-
-  alias RpcEx.Reflection
 
   @default_scheme :http
   @default_port 4444
