@@ -15,6 +15,7 @@ Built on modern Elixir tooling (Bandit for servers, Mint for clients) and follow
 - **Middleware Support**: Composable middleware chain for cross-cutting concerns (auth, logging, etc.)
 - **Pluggable Authentication**: Validate clients during handshake with custom auth modules
 - **Reconnection**: Built-in exponential backoff reconnection strategy for clients
+- **Cluster-Aware Pools**: Optional Horde integration for distributed client pools and connection registries
 - **Type-Safe**: Comprehensive typespecs throughout for Dialyzer compatibility
 
 ## Installation
@@ -164,6 +165,69 @@ end
 ```
 
 See `RpcEx.Server.Auth` for detailed documentation.
+
+## Horde Integration
+
+RpcEx can optionally leverage [Horde](https://github.com/derekkraan/horde) to run
+redundant client connections across a cluster and to expose server-side
+connection registries that other nodes can call through.
+
+### Distributed client pools
+
+Add the Horde registry, Horde dynamic supervisor, and the
+`RpcEx.Horde.ClientPool` to your supervision tree. The registry should use
+duplicate keys so each connection can share the same lookup key.
+
+```elixir
+children = [
+  RpcEx.Horde.registry_child_spec(name: MyApp.RpcRegistry, keys: :duplicate),
+  RpcEx.Horde.client_supervisor_spec(name: MyApp.RpcSupervisor),
+  {RpcEx.Horde.ClientPool,
+   name: MyApp.RpcPool,
+   registry: MyApp.RpcRegistry,
+   supervisor: MyApp.RpcSupervisor,
+   pool_key: {:rpc_ex, :clients, :upstream},
+   pool_size: 4,
+   client_opts: [
+     url: "wss://upstream.example/rpc",
+     router: MyApp.ClientRouter,
+     headers: [{"x-cluster-id", to_string(node())}]
+   ]}
+]
+
+Supervisor.start_link(children, strategy: :one_for_one)
+
+# Issue calls through the pool (load balanced across connections)
+{:ok, reply, _meta} = RpcEx.Horde.ClientPool.call(MyApp.RpcPool, :upstream_call)
+```
+
+Each connection advertises its status in the registry. Metadata is merged with
+the map provided via `:metadata` and automatically records the current node,
+connection status, and negotiated session details.
+
+### Server-side registries
+
+Enable Horde registration on the server to keep track of inbound connections and
+reuse reverse channels from any node in the cluster:
+
+```elixir
+{RpcEx.Server,
+ router: MyApp.Router,
+ port: 4000,
+ horde: [registry: MyApp.RpcRegistry, key: {:rpc_ex, :servers, :upstream}]}
+```
+
+You can then select a healthy peer and initiate calls back to the client:
+
+```elixir
+with {:ok, peer, meta} <- RpcEx.Horde.ServerRegistry.pick_peer(MyApp.RpcRegistry, {:rpc_ex, :servers, :upstream}) do
+  {:ok, result, _meta} = RpcEx.Peer.call(peer, :client_route, args: %{message: "hello"})
+end
+```
+
+When connections terminate, the registry entry is removed automatically. Before
+shutdown, the handler updates the status to `:disconnected` so other nodes can
+react quickly.
 
 ## Middleware
 

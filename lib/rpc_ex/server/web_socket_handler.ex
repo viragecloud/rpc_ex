@@ -3,6 +3,9 @@ defmodule RpcEx.Server.WebSocketHandler do
 
   @behaviour WebSock
 
+  require Logger
+
+  alias Horde.Registry
   alias RpcEx.Peer
   alias RpcEx.Protocol.{Frame, Handshake}
   alias RpcEx.Server.Connection
@@ -14,7 +17,11 @@ defmodule RpcEx.Server.WebSocketHandler do
           connection: Connection.t() | nil,
           context: map(),
           auth: {module(), keyword()} | nil,
-          pending_peer_calls: %{binary() => {reference(), pid()}}
+          pending_peer_calls: %{binary() => {reference(), pid()}},
+          horde_opts: map() | nil,
+          horde_registry: atom() | nil,
+          horde_key: term() | nil,
+          horde_meta: map()
         }
 
   @impl WebSock
@@ -26,7 +33,11 @@ defmodule RpcEx.Server.WebSocketHandler do
       auth: Map.get(opts, :auth),
       negotiated?: false,
       connection: nil,
-      pending_peer_calls: %{}
+      pending_peer_calls: %{},
+      horde_opts: normalize_horde_opts(Map.get(opts, :horde)),
+      horde_registry: nil,
+      horde_key: nil,
+      horde_meta: %{}
     }
 
     {:ok, state}
@@ -97,7 +108,10 @@ defmodule RpcEx.Server.WebSocketHandler do
   def handle_info(_msg, state), do: {:ok, state}
 
   @impl WebSock
-  def terminate(_reason, _state), do: :ok
+  def terminate(_reason, state) do
+    update_horde_status(state, :disconnected)
+    :ok
+  end
 
   defp negotiate(%{router: router} = state, payload) do
     local = Handshake.build(state.handshake_opts || [])
@@ -130,7 +144,13 @@ defmodule RpcEx.Server.WebSocketHandler do
           meta: session.meta
         })
 
-      {:ok, reply, %{state | negotiated?: true, connection: connection}}
+      new_state =
+        state
+        |> Map.put(:negotiated?, true)
+        |> Map.put(:connection, connection)
+        |> register_with_horde(session, payload)
+
+      {:ok, reply, new_state}
     end
   end
 
@@ -200,6 +220,96 @@ defmodule RpcEx.Server.WebSocketHandler do
         send(from_pid, {:peer_reply, ref, {:error, {reason, detail}}})
         {:ok, %{state | pending_peer_calls: pending}}
     end
+  end
+
+  defp normalize_horde_opts(nil), do: nil
+  defp normalize_horde_opts(%{} = opts), do: opts
+  defp normalize_horde_opts(opts) when is_list(opts), do: Enum.into(opts, %{})
+  defp normalize_horde_opts(_), do: nil
+
+  defp register_with_horde(%{horde_opts: nil} = state, _session, _payload), do: state
+
+  defp register_with_horde(
+         %{horde_opts: %{registry: registry, key: key} = opts} = state,
+         session,
+         payload
+       )
+       when is_atom(registry) do
+    base_meta =
+      opts
+      |> Map.get(:meta, %{})
+      |> Map.new()
+      |> Map.merge(session_horde_meta(session))
+      |> maybe_put(:client_meta, Map.get(payload, :meta))
+      |> maybe_put(:router, state.router)
+      |> Map.put(:node, node())
+
+    case safe_register(registry, key, Map.put(base_meta, :status, :ready)) do
+      {:ok, _pid} ->
+        %{state | horde_registry: registry, horde_key: key, horde_meta: base_meta}
+        |> update_horde_status(:ready)
+
+      {:error, {:already_registered, pid}} ->
+        Logger.warning(
+          "Horde registry already has connection entry for #{inspect(key)} (#{inspect(pid)})"
+        )
+
+        %{state | horde_registry: registry, horde_key: key, horde_meta: base_meta}
+        |> update_horde_status(:ready)
+
+      {:error, reason} ->
+        Logger.warning("Failed to register server connection with Horde: #{inspect(reason)}")
+        state
+    end
+  rescue
+    _ -> state
+  end
+
+  defp register_with_horde(state, _session, _payload), do: state
+
+  defp safe_register(registry, key, value) do
+    Registry.register(registry, key, value)
+  rescue
+    exception -> {:error, exception}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp update_horde_status(state, status, extra \\ %{})
+  defp update_horde_status(%{horde_registry: nil} = state, _status, _extra), do: state
+
+  defp update_horde_status(state, status, extra) do
+    meta =
+      state.horde_meta
+      |> Map.merge(extra)
+      |> Map.put(:status, status)
+      |> Map.put_new(:node, node())
+      |> compact_meta()
+
+    case Registry.update_value(state.horde_registry, state.horde_key, fn _ -> meta end) do
+      {:error, _} -> state
+      _ -> state
+    end
+  rescue
+    _ -> state
+  end
+
+  defp session_horde_meta(session) do
+    %{}
+    |> maybe_put(:protocol_version, Map.get(session, :protocol_version))
+    |> maybe_put(:compression, Map.get(session, :compression))
+    |> maybe_put(:encoding, Map.get(session, :encoding))
+    |> maybe_put(:capabilities, Map.get(session, :remote_capabilities))
+    |> maybe_put(:session_meta, Map.get(session, :meta))
+  end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  defp compact_meta(map) do
+    map
+    |> Enum.reject(fn {_k, v} -> is_nil(v) end)
+    |> Enum.into(%{})
   end
 
   defp reason_to_binary(reason) when is_atom(reason), do: Atom.to_string(reason)
