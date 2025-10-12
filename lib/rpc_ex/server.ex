@@ -33,6 +33,7 @@ defmodule RpcEx.Server do
   - `:scheme` - `:http` or `:https` (default: `:http`)
   - `:context` - Custom context map passed to all handlers
   - `:auth` - Authentication module `{module, opts}` implementing `RpcEx.Server.Auth`
+  - `:horde` - Horde registration options for tracking inbound connections
   - `:handshake` - Options for protocol handshake negotiation
   - `:name` - Name for process registration
 
@@ -79,6 +80,7 @@ defmodule RpcEx.Server do
           | {:telemetry_prefix, [atom()]}
           | {:url, String.t()}
           | {:connection_options, keyword()}
+          | {:horde, keyword()}
 
   @default_scheme :http
   @default_port 4444
@@ -98,7 +100,8 @@ defmodule RpcEx.Server do
       handshake: Keyword.get(opts, :handshake, []),
       context: Keyword.get(opts, :context, %{}),
       auth: Keyword.get(opts, :auth),
-      websocket: Keyword.get(opts, :connection_options, [])
+      websocket: Keyword.get(opts, :connection_options, []),
+      horde: Keyword.get(opts, :horde)
     ]
 
     bandit_opts =

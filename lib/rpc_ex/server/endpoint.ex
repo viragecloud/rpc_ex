@@ -16,7 +16,8 @@ defmodule RpcEx.Server.Endpoint do
       router: Keyword.fetch!(opts, :router),
       handshake_opts: Keyword.get(opts, :handshake, []),
       context: Keyword.get(opts, :context, %{}),
-      auth: Keyword.get(opts, :auth)
+      auth: Keyword.get(opts, :auth),
+      horde: Keyword.get(opts, :horde)
     }
 
     websocket_opts =

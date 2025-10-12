@@ -41,6 +41,7 @@ defmodule RpcEx.MixProject do
       {:mint_web_socket, "~> 1.0"},
       {:nimble_options, "~> 1.0"},
       {:telemetry, "~> 1.2"},
+      {:horde, "~> 0.9"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev], runtime: false},
       {:ex_doc, "~> 0.31", only: :dev, runtime: false},

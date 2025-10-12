@@ -13,6 +13,7 @@ defmodule RpcEx.Client do
 
   require Logger
 
+  alias Horde.Registry
   alias Mint.{HTTP, WebSocket}
   alias RpcEx.Client.Connection
   alias RpcEx.Peer
@@ -35,6 +36,8 @@ defmodule RpcEx.Client do
           | {:telemetry_prefix, [atom()]}
           | {:transport_opts, keyword()}
           | {:websocket_opts, keyword()}
+          | {:headers, [{binary(), binary()}]}
+          | {:horde, keyword() | map()}
 
   @type call_option ::
           {:timeout, non_neg_integer()}
@@ -50,7 +53,6 @@ defmodule RpcEx.Client do
               websocket: nil,
               request_ref: nil,
               status: nil,
-              headers: nil,
               connection_status: :connecting,
               router: nil,
               connection: nil,
@@ -68,7 +70,11 @@ defmodule RpcEx.Client do
               hello_sent?: false,
               reconnect_config: nil,
               reconnect_attempt: 0,
-              reconnect_timer: nil
+              reconnect_timer: nil,
+              headers: [],
+              horde_registry: nil,
+              horde_key: nil,
+              horde_meta: %{}
   end
 
   ## Public API
@@ -132,6 +138,7 @@ defmodule RpcEx.Client do
     context = Keyword.get(opts, :context, %{})
     transport_opts = Keyword.get(opts, :transport_opts, [])
     websocket_opts = Keyword.get(opts, :websocket_opts, compress: false)
+    headers = Keyword.get(opts, :headers, [])
     reconnect_config = parse_reconnect_config(Keyword.get(opts, :reconnect, true))
 
     {scheme, host, port, path} = connection_target(opts)
@@ -155,9 +162,12 @@ defmodule RpcEx.Client do
       path: path,
       transport_opts: transport_opts,
       websocket_opts: websocket_opts,
+      headers: headers,
       reconnect_config: reconnect_config,
       connection_status: :connecting
     }
+
+    state = maybe_register_with_horde(state, opts)
 
     {:ok, state, {:continue, :connect}}
   end
@@ -169,14 +179,13 @@ defmodule RpcEx.Client do
 
     case HTTP.connect(http_scheme, state.host, state.port, state.transport_opts) do
       {:ok, conn} ->
+        headers = upgrade_headers(state)
+
         case WebSocket.upgrade(
                ws_scheme,
                conn,
                state.path,
-               [
-                 {"host", host_header(state.host, state.port, state.scheme)},
-                 {"sec-websocket-protocol", @subprotocol}
-               ],
+               headers,
                Keyword.put_new(state.websocket_opts, :subprotocols, [@subprotocol])
              ) do
           {:ok, conn, ref} ->
@@ -476,13 +485,14 @@ defmodule RpcEx.Client do
         # Successful connection - reset reconnect attempt counter
         Logger.info("Client connected and ready")
 
-        {:noreply,
-         %{
-           state
-           | connection_status: :ready,
-             connection: connection,
-             reconnect_attempt: 0
-         }}
+        state =
+          state
+          |> Map.put(:connection_status, :ready)
+          |> Map.put(:connection, connection)
+          |> Map.put(:reconnect_attempt, 0)
+          |> put_horde_meta(session_horde_meta(session))
+
+        {:noreply, update_horde_status(state, :ready)}
 
       {:error, reason} ->
         Logger.error("Handshake negotiation failed: #{inspect(reason)}")
@@ -648,6 +658,27 @@ defmodule RpcEx.Client do
     end
   end
 
+  defp upgrade_headers(state) do
+    base = [
+      {"host", host_header(state.host, state.port, state.scheme)},
+      {"sec-websocket-protocol", @subprotocol}
+    ]
+
+    merge_headers(base, state.headers)
+  end
+
+  defp merge_headers(base, headers) when is_list(headers) do
+    Enum.reduce(headers, base, fn
+      {key, value}, acc when is_binary(key) and is_binary(value) ->
+        acc ++ [{key, value}]
+
+      _, acc ->
+        acc
+    end)
+  end
+
+  defp merge_headers(base, _headers), do: base
+
   ## Connection Target Parsing
 
   defp connection_target(opts) do
@@ -739,13 +770,13 @@ defmodule RpcEx.Client do
     state = fail_pending_calls(state, {:error, :disconnected})
 
     # Clean up connection state
-    state = %{
+    state =
       state
-      | conn: nil,
-        websocket: nil,
-        request_ref: nil,
-        connection_status: :disconnected
-    }
+      |> Map.put(:conn, nil)
+      |> Map.put(:websocket, nil)
+      |> Map.put(:request_ref, nil)
+      |> Map.put(:connection_status, :disconnected)
+      |> update_horde_status(:disconnected, %{last_error: inspect(reason)})
 
     case should_reconnect?(state) do
       true ->
@@ -770,8 +801,15 @@ defmodule RpcEx.Client do
     Logger.info("Scheduling reconnect attempt #{state.reconnect_attempt + 1} in #{delay}ms")
 
     timer = Process.send_after(self(), :reconnect, delay)
+    next_attempt = state.reconnect_attempt + 1
 
-    {:noreply, %{state | reconnect_timer: timer, reconnect_attempt: state.reconnect_attempt + 1}}
+    state =
+      state
+      |> Map.put(:reconnect_timer, timer)
+      |> Map.put(:reconnect_attempt, next_attempt)
+      |> update_horde_status(:connecting, %{reconnect_attempt: next_attempt, reconnect_in: delay})
+
+    {:noreply, state}
   end
 
   defp calculate_backoff(%{reconnect_config: config, reconnect_attempt: attempt}) do
@@ -797,5 +835,108 @@ defmodule RpcEx.Client do
     end)
 
     %{state | pending: %{}}
+  end
+
+  ## Horde integration helpers
+
+  defp maybe_register_with_horde(state, opts) do
+    opts
+    |> Keyword.get(:horde)
+    |> normalize_horde_opts()
+    |> register_with_horde(state)
+  end
+
+  defp register_with_horde(nil, state), do: state
+
+  defp register_with_horde(%{registry: registry, key: key} = opts, state)
+       when is_atom(registry) do
+    base_meta =
+      opts
+      |> Map.get(:meta, %{})
+      |> Map.new()
+      |> Map.merge(%{node: node()})
+      |> maybe_put(:pool, Map.get(opts, :pool))
+      |> maybe_put(:index, Map.get(opts, :index))
+
+    case safe_register(registry, key, Map.put(base_meta, :status, :connecting)) do
+      {:ok, _pid} ->
+        state = %{state | horde_registry: registry, horde_key: key, horde_meta: base_meta}
+        update_horde_status(state, :connecting)
+
+      {:error, {:already_registered, pid}} ->
+        Logger.warning(
+          "Horde registry already has an entry for #{inspect(key)} (#{inspect(pid)})"
+        )
+
+        state = %{state | horde_registry: registry, horde_key: key, horde_meta: base_meta}
+        update_horde_status(state, :connecting)
+
+      {:error, reason} ->
+        Logger.warning("Failed to register RpcEx client with Horde: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp register_with_horde(_invalid, state) do
+    Logger.warning("Ignoring invalid Horde options for RpcEx client")
+    state
+  end
+
+  defp normalize_horde_opts(nil), do: nil
+  defp normalize_horde_opts(%{} = opts), do: opts
+  defp normalize_horde_opts(opts) when is_list(opts), do: Enum.into(opts, %{})
+  defp normalize_horde_opts(_), do: nil
+
+  defp safe_register(registry, key, meta) do
+    Registry.register(registry, key, meta)
+  rescue
+    exception -> {:error, exception}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp update_horde_status(state, status, extra \\ %{})
+  defp update_horde_status(%{horde_registry: nil} = state, _status, _extra), do: state
+
+  defp update_horde_status(state, status, extra) do
+    meta =
+      state.horde_meta
+      |> Map.merge(%{node: node(), timeout: state.timeout})
+      |> Map.merge(extra)
+      |> Map.put(:status, status)
+      |> compact_meta()
+
+    case Registry.update_value(state.horde_registry, state.horde_key, fn _ -> meta end) do
+      {:error, _} -> state
+      _ -> state
+    end
+  rescue
+    _ -> state
+  end
+
+  defp put_horde_meta(%{horde_registry: nil} = state, _meta), do: state
+
+  defp put_horde_meta(state, meta) when is_map(meta) do
+    %{state | horde_meta: Map.merge(state.horde_meta, meta)}
+  end
+
+  defp put_horde_meta(state, _meta), do: state
+
+  defp session_horde_meta(session) do
+    %{}
+    |> maybe_put(:protocol_version, Map.get(session, :protocol_version))
+    |> maybe_put(:compression, Map.get(session, :compression))
+    |> maybe_put(:encoding, Map.get(session, :encoding))
+    |> maybe_put(:capabilities, Map.get(session, :remote_capabilities))
+    |> maybe_put(:session_meta, Map.get(session, :meta))
+  end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  defp compact_meta(map) do
+    map
+    |> Enum.reject(fn {_k, v} -> is_nil(v) end)
+    |> Enum.into(%{})
   end
 end
