@@ -56,6 +56,7 @@ defmodule RpcEx.Client do
               connection: nil,
               pending: %{},
               pending_peer_calls: %{},
+              pending_streams: %{},
               timeout: 5_000,
               handshake: nil,
               handshake_payload: nil,
@@ -120,6 +121,16 @@ defmodule RpcEx.Client do
           {:ok, list(), map()} | {:error, term()}
   def discover(client, opts \\ []) do
     GenServer.call(client, {:discover, opts})
+  end
+
+  @doc """
+  Initiates a streaming RPC call and returns a lazy Stream.
+  """
+  @spec stream(GenServer.name(), RpcEx.route(), keyword()) ::
+          {:ok, Enumerable.t(), map()} | {:error, term()}
+  def stream(client, route, opts \\ []) do
+    timeout = Keyword.get(opts, :timeout, 30_000)
+    GenServer.call(client, {:stream, route, opts}, timeout + 1_000)
   end
 
   ## GenServer callbacks
@@ -274,6 +285,78 @@ defmodule RpcEx.Client do
     {:reply, {:error, :not_connected}, state}
   end
 
+  def handle_call({:stream, route, opts}, from, %{connection_status: :ready} = state) do
+    args = Keyword.get(opts, :args, %{})
+    timeout = Keyword.get(opts, :timeout, state.timeout)
+    meta = Keyword.get(opts, :meta)
+    msg_id = generate_id()
+
+    payload = %{
+      msg_id: msg_id,
+      route: route,
+      args: args,
+      timeout_ms: timeout,
+      meta: meta
+    }
+
+    case send_frame(Frame.new(:call, payload), state) do
+      {:ok, state} ->
+        # Create a lazy stream that will pull from the GenServer
+        stream = build_stream(self(), msg_id, timeout)
+
+        # Store the from ref and stream state
+        timer = if timeout != :infinity, do: Process.send_after(self(), {:stream_timeout, msg_id}, timeout), else: nil
+
+        pending_streams = Map.put(state.pending_streams, msg_id, %{
+          from: from,
+          timer: timer,
+          chunks: [],
+          status: :streaming
+        })
+
+        {:reply, {:ok, stream, %{}}, %{state | pending_streams: pending_streams}}
+
+      {:error, reason, state} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:stream, _route, _opts}, _from, state) do
+    {:reply, {:error, :not_connected}, state}
+  end
+
+  def handle_call({:stream_next, msg_id}, from, state) do
+    case Map.get(state.pending_streams, msg_id) do
+      nil ->
+        {:reply, {:error, :not_found}, state}
+
+      stream_state ->
+        case {stream_state.chunks, stream_state.status} do
+          # Has buffered chunks - return first one
+          {[chunk | rest], _} ->
+            pending_streams = Map.update!(state.pending_streams, msg_id, fn st ->
+              %{st | chunks: rest}
+            end)
+            {:reply, {:chunk, chunk}, %{state | pending_streams: pending_streams}}
+
+          # No chunks but complete - return complete
+          {[], :complete} ->
+            {:reply, :stream_complete, %{state | pending_streams: Map.delete(state.pending_streams, msg_id)}}
+
+          # No chunks but error - return error
+          {[], {:error, {code, error}}} ->
+            {:reply, {:stream_error, {code, error}}, %{state | pending_streams: Map.delete(state.pending_streams, msg_id)}}
+
+          # No chunks and still streaming - wait for next chunk
+          {[], :streaming} ->
+            pending_streams = Map.update!(state.pending_streams, msg_id, fn st ->
+              Map.put(st, :waiting_from, from)
+            end)
+            {:noreply, %{state | pending_streams: pending_streams}}
+        end
+    end
+  end
+
   @impl GenServer
   def handle_info(:reconnect, state) do
     Logger.info("Attempting to reconnect...")
@@ -289,6 +372,19 @@ defmodule RpcEx.Client do
         if timer, do: Process.cancel_timer(timer)
         GenServer.reply(from, {:error, :timeout})
         {:noreply, %{state | pending: pending}}
+    end
+  end
+
+  def handle_info({:stream_timeout, msg_id}, state) do
+    case Map.pop(state.pending_streams, msg_id) do
+      {nil, _pending} ->
+        {:noreply, state}
+
+      {stream_state, pending_streams} ->
+        if stream_state.timer, do: Process.cancel_timer(stream_state.timer)
+        # Notify stream consumer of timeout
+        send(self(), {:stream_error_occurred, msg_id, {:timeout, "Stream timeout"}})
+        {:noreply, %{state | pending_streams: pending_streams}}
     end
   end
 
@@ -543,6 +639,18 @@ defmodule RpcEx.Client do
     {:noreply, state}
   end
 
+  defp handle_rpc_frame(%Frame{type: :stream, payload: payload}, state) do
+    {:noreply, handle_stream_chunk(payload, state)}
+  end
+
+  defp handle_rpc_frame(%Frame{type: :stream_end, payload: payload}, state) do
+    {:noreply, handle_stream_end(payload, state)}
+  end
+
+  defp handle_rpc_frame(%Frame{type: :stream_error, payload: payload}, state) do
+    {:noreply, handle_stream_error(payload, state)}
+  end
+
   defp handle_rpc_frame(%Frame{type: type}, state) do
     Logger.warning("Received unexpected frame type: #{inspect(type)}")
     {:noreply, state}
@@ -619,6 +727,105 @@ defmodule RpcEx.Client do
         GenServer.reply(from, {:ok, entries, meta})
         %{state | pending: pending}
     end
+  end
+
+  ## Stream Handling
+
+  defp handle_stream_chunk(%{msg_id: msg_id, chunk: chunk}, state) do
+    case Map.get(state.pending_streams, msg_id) do
+      nil ->
+        Logger.warning("Received stream chunk for unknown msg_id: #{msg_id}")
+        state
+
+      stream_state ->
+        # Store chunk in queue
+        chunks = stream_state.chunks ++ [chunk]
+        pending_streams = Map.put(state.pending_streams, msg_id, %{stream_state | chunks: chunks})
+
+        # If someone is waiting for next chunk, reply immediately
+        if Map.has_key?(stream_state, :waiting_from) do
+          GenServer.reply(stream_state.waiting_from, {:chunk, chunk})
+          pending_streams = Map.update!(pending_streams, msg_id, fn st ->
+            st |> Map.put(:chunks, []) |> Map.delete(:waiting_from)
+          end)
+          %{state | pending_streams: pending_streams}
+        else
+          %{state | pending_streams: pending_streams}
+        end
+    end
+  end
+
+  defp handle_stream_end(%{msg_id: msg_id}, state) do
+    case Map.get(state.pending_streams, msg_id) do
+      nil ->
+        Logger.warning("Received stream_end for unknown msg_id: #{msg_id}")
+        state
+
+      stream_state ->
+        if stream_state.timer, do: Process.cancel_timer(stream_state.timer)
+
+        # Mark as complete and reply if someone is waiting
+        pending_streams = Map.update!(state.pending_streams, msg_id, fn st ->
+          Map.put(st, :status, :complete)
+        end)
+
+        if Map.has_key?(stream_state, :waiting_from) do
+          GenServer.reply(stream_state.waiting_from, :stream_complete)
+          %{state | pending_streams: Map.delete(pending_streams, msg_id)}
+        else
+          %{state | pending_streams: pending_streams}
+        end
+    end
+  end
+
+  defp handle_stream_error(%{msg_id: msg_id, error: error, code: code}, state) do
+    case Map.get(state.pending_streams, msg_id) do
+      nil ->
+        Logger.warning("Received stream_error for unknown msg_id: #{msg_id}")
+        state
+
+      stream_state ->
+        if stream_state.timer, do: Process.cancel_timer(stream_state.timer)
+
+        # Store error and reply if someone is waiting
+        pending_streams = Map.update!(state.pending_streams, msg_id, fn st ->
+          Map.put(st, :status, {:error, {code, error}})
+        end)
+
+        if Map.has_key?(stream_state, :waiting_from) do
+          GenServer.reply(stream_state.waiting_from, {:stream_error, {code, error}})
+          %{state | pending_streams: Map.delete(pending_streams, msg_id)}
+        else
+          %{state | pending_streams: pending_streams}
+        end
+    end
+  end
+
+  defp build_stream(client_pid, msg_id, _timeout) do
+    Stream.resource(
+      fn -> {client_pid, msg_id, :active} end,
+      fn
+        {_pid, _id, :done} = acc ->
+          {:halt, acc}
+
+        {pid, id, :active} = acc ->
+          # Request next chunk from GenServer
+          case GenServer.call(pid, {:stream_next, id}, :infinity) do
+            {:chunk, chunk} ->
+              {[chunk], acc}
+
+            :stream_complete ->
+              {:halt, {pid, id, :done}}
+
+            {:stream_error, {code, error}} ->
+              raise "Stream error (#{code}): #{error}"
+
+            {:error, reason} ->
+              raise "Stream failed: #{inspect(reason)}"
+          end
+      end,
+      fn {_pid, _id, _status} -> :ok end
+    )
   end
 
   ## Frame Sending

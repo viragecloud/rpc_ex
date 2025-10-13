@@ -15,6 +15,9 @@ defmodule RpcEx.MixProject do
         credo: :test,
         dialyzer: :dev,
         "hex.publish": :prod
+      ],
+      test_coverage: [
+        ignore_modules: [~r/^RpcEx.Test/]
       ]
     ]
   end

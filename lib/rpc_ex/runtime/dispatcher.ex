@@ -107,6 +107,106 @@ defmodule RpcEx.Runtime.Dispatcher do
     {{:reply, reply}, context}
   end
 
+  @doc """
+  Handles an inbound `:stream` call by initiating streaming execution.
+
+  Returns `:async` to indicate that the handler will be processed asynchronously.
+  The caller is responsible for spawning a task to process the stream.
+  """
+  @spec dispatch_stream(
+          module(),
+          map(),
+          context(),
+          session(),
+          pid(),
+          keyword()
+        ) :: :async
+  def dispatch_stream(router, payload, context, session, caller_pid, opts \\ []) do
+    case fetch_route(payload) do
+      {:ok, route} ->
+        args = Map.get(payload, :args, %{})
+        msg_id = Map.get(payload, :msg_id)
+        dispatch_opts = build_call_opts(payload, opts)
+        base_context = build_context(context, session, Map.get(payload, :meta))
+
+        # Spawn a task to handle the streaming
+        Task.start(fn ->
+          execute_stream_handler(router, route, msg_id, args, base_context, dispatch_opts, caller_pid)
+        end)
+
+        :async
+
+      {:error, reason} ->
+        log_invalid_payload(:stream, reason, payload)
+        msg_id = Map.get(payload, :msg_id)
+        error_frame = build_stream_error_frame(msg_id, reason, "Invalid payload")
+        send(caller_pid, {:stream_error, error_frame})
+        :async
+    end
+  end
+
+  defp execute_stream_handler(router, route, msg_id, args, context, opts, caller_pid) do
+    try do
+      case Executor.dispatch(router, :stream, route, args, context, opts) do
+        {:ok, enumerable, _new_ctx} ->
+          stream_enumerable(enumerable, msg_id, caller_pid)
+
+        {:halt, enumerable, _new_ctx} ->
+          stream_enumerable(enumerable, msg_id, caller_pid)
+
+        {:error, {:unknown_route, _}} ->
+          error_frame = build_stream_error_frame(msg_id, :unknown_route, "Unknown route: #{route}")
+          send(caller_pid, {:stream_error, error_frame})
+      end
+    rescue
+      exception ->
+        error_frame = build_stream_error_frame(msg_id, :internal_error, Exception.message(exception))
+        send(caller_pid, {:stream_error, error_frame})
+    catch
+      kind, reason ->
+        error_frame = build_stream_error_frame(msg_id, :internal_error, "#{kind}: #{inspect(reason)}")
+        send(caller_pid, {:stream_error, error_frame})
+    end
+  end
+
+  defp stream_enumerable(enumerable, msg_id, caller_pid) do
+    try do
+      enumerable
+      |> Stream.with_index(1)
+      |> Enum.each(fn {chunk, sequence} ->
+        frame = Frame.new(:stream, %{
+          msg_id: msg_id,
+          chunk: chunk,
+          meta: %{sequence: sequence}
+        })
+        send(caller_pid, {:stream_chunk, frame})
+      end)
+
+      # Send stream_end when complete
+      end_frame = Frame.new(:stream_end, %{
+        msg_id: msg_id,
+        meta: %{}
+      })
+      send(caller_pid, {:stream_end, end_frame})
+    rescue
+      exception ->
+        error_frame = build_stream_error_frame(msg_id, :stream_error, Exception.message(exception))
+        send(caller_pid, {:stream_error, error_frame})
+    catch
+      kind, reason ->
+        error_frame = build_stream_error_frame(msg_id, :stream_error, "#{kind}: #{inspect(reason)}")
+        send(caller_pid, {:stream_error, error_frame})
+    end
+  end
+
+  defp build_stream_error_frame(msg_id, code, message) do
+    Frame.new(:stream_error, %{
+      msg_id: msg_id,
+      error: message,
+      code: code
+    })
+  end
+
   defp respond_call(route, msg_id, result, context) do
     case normalize_call_result(result) do
       {:reply, value, meta} ->

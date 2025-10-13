@@ -17,6 +17,9 @@ defmodule RpcEx.Protocol.Frame do
           | :discover
           | :discover_reply
           | :heartbeat
+          | :stream
+          | :stream_end
+          | :stream_error
 
   @enforce_keys [:type, :payload]
   defstruct type: nil, version: 1, payload: %{}

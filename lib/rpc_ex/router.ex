@@ -54,6 +54,8 @@ defmodule RpcEx.Router do
 
   Cast handlers should return `:ok`, `{:notify, payload}`, or `:noreply`.
 
+  Stream handlers should return an `Enumerable` (Stream, List, etc.).
+
   ## Middleware
 
   Middleware can be applied to routes using the `middleware/1` or `middleware/2` macro.
@@ -77,7 +79,7 @@ defmodule RpcEx.Router do
   defmacro __using__(opts \\ []) do
     quote do
       import RpcEx.Router,
-        only: [call: 2, call: 3, cast: 2, cast: 3, middleware: 1, middleware: 2]
+        only: [call: 2, call: 3, cast: 2, cast: 3, stream: 2, stream: 3, middleware: 1, middleware: 2]
 
       Module.register_attribute(__MODULE__, :rpc_routes, accumulate: true, persist: true)
       Module.register_attribute(__MODULE__, :rpc_middlewares, accumulate: true, persist: true)
@@ -138,6 +140,17 @@ defmodule RpcEx.Router do
 
   defmacro cast(name, opts, do: block) when is_list(opts) do
     define_route(:cast, name, opts, block, __CALLER__)
+  end
+
+  @doc """
+  Defines a streaming RPC route.
+  """
+  defmacro stream(name, do: block) do
+    define_route(:stream, name, [], block, __CALLER__)
+  end
+
+  defmacro stream(name, opts, do: block) when is_list(opts) do
+    define_route(:stream, name, opts, block, __CALLER__)
   end
 
   @doc false

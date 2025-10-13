@@ -38,19 +38,19 @@ defmodule RpcEx.Server.Connection do
           | {:push, Frame.t(), t()}
           | {:noreply, t()}
           | {:async, t()}
-  def handle_frame(%Frame{type: :call, payload: payload}, state) do
-    # Spawn handler in a task to avoid blocking the WebSocket process
-    # This allows bidirectional RPC where handlers can call back to the peer
-    caller = self()
+  def handle_frame(%Frame{type: :call, payload: %{route: route} = payload}, state) do
+    # Check if this is a stream route
+    case lookup_route_kind(state.router, route) do
+      {:ok, :stream} ->
+        # Handle as stream
+        caller = self()
+        Dispatcher.dispatch_stream(state.router, payload, state.context, state.session, caller)
+        {:async, state}
 
-    Task.start(fn ->
-      {action, new_ctx} =
-        Dispatcher.dispatch_call(state.router, payload, state.context, state.session)
-
-      send(caller, {:handler_result, :call, action, new_ctx})
-    end)
-
-    {:async, state}
+      _ ->
+        # Handle as regular call (existing behavior)
+        handle_regular_call(payload, state)
+    end
   end
 
   def handle_frame(%Frame{type: :cast, payload: payload}, state) do
@@ -68,6 +68,34 @@ defmodule RpcEx.Server.Connection do
   end
 
   def handle_frame(_frame, state), do: {:noreply, state}
+
+  defp handle_regular_call(payload, state) do
+    # Spawn handler in a task to avoid blocking the WebSocket process
+    # This allows bidirectional RPC where handlers can call back to the peer
+    caller = self()
+
+    Task.start(fn ->
+      {action, new_ctx} =
+        Dispatcher.dispatch_call(state.router, payload, state.context, state.session)
+
+      send(caller, {:handler_result, :call, action, new_ctx})
+    end)
+
+    {:async, state}
+  end
+
+  defp lookup_route_kind(router, route_name) do
+    try do
+      router.__rpc_routes__()
+      |> Enum.find(fn %RpcEx.Router.Route{name: name} -> name == route_name end)
+      |> case do
+        %RpcEx.Router.Route{kind: kind} -> {:ok, kind}
+        nil -> {:error, :not_found}
+      end
+    rescue
+      _ -> {:error, :not_found}
+    end
+  end
 
   defp wrap({:reply, frame}, state), do: {:reply, frame, state}
   defp wrap({:push, frame}, state), do: {:push, frame, state}

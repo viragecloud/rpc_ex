@@ -35,4 +35,41 @@ defmodule RpcEx.Test.Integration.ServerRouter do
     Process.sleep(delay)
     {:ok, %{sum: args[:a] + args[:b], delay: delay}}
   end
+
+  stream :simple_stream do
+    _ = context
+    _ = opts
+    count = args[:count] || 5
+    if count > 0, do: 1..count, else: []
+  end
+
+  stream :range_stream do
+    _ = context
+    _ = opts
+    start = args[:start] || 1
+    stop = args[:stop] || 10
+    start..stop
+  end
+
+  stream :lazy_stream do
+    _ = context
+    _ = opts
+    count = args[:count] || 10
+    Stream.iterate(1, &(&1 + 1)) |> Stream.take(count)
+  end
+
+  stream :error_stream do
+    _ = context
+    _ = opts
+    _ = args
+    Stream.resource(
+      fn -> 0 end,
+      fn
+        3 -> raise "Stream error at chunk 3"
+        n when n < 5 -> {[n], n + 1}
+        _ -> {:halt, nil}
+      end,
+      fn _ -> :ok end
+    )
+  end
 end

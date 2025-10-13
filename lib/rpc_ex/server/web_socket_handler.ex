@@ -94,6 +94,18 @@ defmodule RpcEx.Server.WebSocketHandler do
     {:push, {:binary, Frame.encode!(frame)}, state}
   end
 
+  def handle_info({:stream_chunk, frame}, state) do
+    {:push, {:binary, Frame.encode!(frame)}, state}
+  end
+
+  def handle_info({:stream_end, frame}, state) do
+    {:push, {:binary, Frame.encode!(frame)}, state}
+  end
+
+  def handle_info({:stream_error, frame}, state) do
+    {:push, {:binary, Frame.encode!(frame)}, state}
+  end
+
   def handle_info(_msg, state), do: {:ok, state}
 
   @impl WebSock
