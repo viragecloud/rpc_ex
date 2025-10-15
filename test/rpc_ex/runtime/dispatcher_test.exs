@@ -68,7 +68,8 @@ defmodule RpcEx.Runtime.DispatcherTest do
       context = %{}
       session = %{}
 
-      {{:reply, frame}, _context} = Dispatcher.dispatch_call(TestRouter, payload, context, session)
+      {{:reply, frame}, _context} =
+        Dispatcher.dispatch_call(TestRouter, payload, context, session)
 
       assert frame.type == :reply
       assert frame.payload.msg_id == "123"
@@ -80,7 +81,8 @@ defmodule RpcEx.Runtime.DispatcherTest do
       context = %{}
       session = %{}
 
-      {{:reply, frame}, _context} = Dispatcher.dispatch_call(TestRouter, payload, context, session)
+      {{:reply, frame}, _context} =
+        Dispatcher.dispatch_call(TestRouter, payload, context, session)
 
       assert frame.type == :error
       assert frame.payload.msg_id == "123"
@@ -92,7 +94,8 @@ defmodule RpcEx.Runtime.DispatcherTest do
       context = %{}
       session = %{}
 
-      {{:reply, frame}, _context} = Dispatcher.dispatch_call(TestRouter, payload, context, session)
+      {{:reply, frame}, _context} =
+        Dispatcher.dispatch_call(TestRouter, payload, context, session)
 
       assert frame.type == :error
       assert frame.payload.reason == :test_error
@@ -123,7 +126,8 @@ defmodule RpcEx.Runtime.DispatcherTest do
       context = %{}
       session = %{}
 
-      {{:reply, frame}, _context} = Dispatcher.dispatch_call(TestRouter, payload, context, session)
+      {{:reply, frame}, _context} =
+        Dispatcher.dispatch_call(TestRouter, payload, context, session)
 
       assert frame.type == :error
       assert frame.payload.reason == :unknown_route
@@ -134,7 +138,8 @@ defmodule RpcEx.Runtime.DispatcherTest do
       context = %{}
       session = %{}
 
-      {{:reply, frame}, _context} = Dispatcher.dispatch_call(TestRouter, payload, context, session)
+      {{:reply, frame}, _context} =
+        Dispatcher.dispatch_call(TestRouter, payload, context, session)
 
       assert frame.type == :error
     end
@@ -195,7 +200,8 @@ defmodule RpcEx.Runtime.DispatcherTest do
       context = %{}
       session = %{test: :session}
 
-      {{:reply, frame}, _context} = Dispatcher.dispatch_discover(TestRouter, payload, context, session)
+      {{:reply, frame}, _context} =
+        Dispatcher.dispatch_discover(TestRouter, payload, context, session)
 
       assert frame.type == :discover_reply
       assert frame.payload.msg_id == "123"
@@ -208,7 +214,8 @@ defmodule RpcEx.Runtime.DispatcherTest do
       context = %{}
       session = %{}
 
-      {{:reply, frame}, _context} = Dispatcher.dispatch_discover(TestRouter, payload, context, session)
+      {{:reply, frame}, _context} =
+        Dispatcher.dispatch_discover(TestRouter, payload, context, session)
 
       assert frame.type == :discover_reply
       assert Enum.all?(frame.payload.entries, fn entry -> entry.kind == :call end)
@@ -219,7 +226,8 @@ defmodule RpcEx.Runtime.DispatcherTest do
       context = %{}
       session = %{user: "test"}
 
-      {{:reply, frame}, _context} = Dispatcher.dispatch_discover(TestRouter, payload, context, session)
+      {{:reply, frame}, _context} =
+        Dispatcher.dispatch_discover(TestRouter, payload, context, session)
 
       assert frame.payload.meta.session == %{user: "test"}
     end

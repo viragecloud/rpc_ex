@@ -62,6 +62,7 @@ defmodule RpcEx.Test.Integration.ServerRouter do
     _ = context
     _ = opts
     _ = args
+
     Stream.resource(
       fn -> 0 end,
       fn

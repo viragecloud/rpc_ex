@@ -112,8 +112,11 @@ mix docs
   - Lifecycle: `:connecting` → `:awaiting_upgrade` → `:awaiting_welcome` → `:ready`
   - Tracks pending calls in `%{msg_id => %{from:, timer:, type:}}` map
   - Supports `call/3`, `cast/3`, `discover/2` operations
+  - Pluggable retry policies via `:retry_policy` option
 - **`RpcEx.Client.Connection`**: Encapsulates client connection state, mirrors server connection responsibilities
-- **`RpcEx.Client2`** (in progress): Alternative client implementation being developed
+- **`RpcEx.RetryPolicy`**: Behavior for custom retry decision logic
+- **`RpcEx.RetryPolicy.Simple`**: Simple max-attempts retry policy
+- **`RpcEx.RetryPolicy.Smart`**: Intelligent error-based retry policy (stops on auth failures, retries on network errors)
 
 #### Runtime & Utilities
 
@@ -207,6 +210,7 @@ See `test/integration/rpc_flow_test.exs` for examples.
 - **Compression**: Enabled by default via `compressed: 6` option; can be negotiated off during handshake
 - **Timeouts**: Per-call timeouts enforced client-side with `Process.send_after`; late replies are dropped
 - **Discovery**: Router introspection via `RpcEx.Reflection.describe/1` or runtime `:discover` message
+- **Retry Policies**: Pluggable retry decision logic; use `RpcEx.RetryPolicy.Smart` for production (fail-fast on auth errors, retry on network issues)
 - **Telemetry**: Events emitted for connection lifecycle, call start/stop/error (planned but not yet fully instrumented)
 
 ## Project Status

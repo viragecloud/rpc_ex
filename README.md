@@ -14,6 +14,7 @@ Built on modern Elixir tooling (Bandit for servers, Mint for clients) and follow
 - **Route Discovery**: Introspect available routes at runtime via reflection API
 - **Middleware Support**: Composable middleware chain for cross-cutting concerns (auth, logging, etc.)
 - **Pluggable Authentication**: Validate clients during handshake with custom auth modules
+- **Intelligent Retry Policies**: Pluggable retry logic with built-in policies for simple max-attempts and smart error-based decisions
 - **Reconnection**: Built-in exponential backoff reconnection strategy for clients
 - **Type-Safe**: Comprehensive typespecs throughout for Dialyzer compatibility
 
@@ -165,6 +166,78 @@ end
 
 See `RpcEx.Server.Auth` for detailed documentation.
 
+## Retry Policies
+
+Control reconnection behavior with pluggable retry policies that decide whether to retry after a disconnect:
+
+```elixir
+# Simple policy - retry up to max attempts (good for testing)
+{:ok, client} = RpcEx.Client.start_link(
+  url: "ws://localhost:4000",
+  retry_policy: {RpcEx.RetryPolicy.Simple, max_attempts: 5}
+)
+
+# Smart policy - intelligent error-based decisions (recommended for production)
+{:ok, client} = RpcEx.Client.start_link(
+  url: "wss://api.example.com",
+  retry_policy: {RpcEx.RetryPolicy.Smart, [
+    # Codes 4000-4999 stop immediately
+    auth_failure_codes: [1002, 1008, 4001],
+    # Custom fatal error matcher
+    fatal_error?: fn
+      {:handshake_failed, _} -> true
+      _ -> false
+    end,
+    # Action on fatal error
+    on_fatal: {MyApp.ErrorHandler, :notify, [:critical]}
+  ]}
+)
+
+# Legacy reconnect option (maps to Simple policy)
+{:ok, client} = RpcEx.Client.start_link(
+  url: "ws://localhost:4000",
+  reconnect: [max_attempts: :infinity, initial_delay: 100]
+)
+```
+
+### Built-in Policies
+
+**RpcEx.RetryPolicy.Simple**
+- Retries all errors equally up to `max_attempts` (default: `:infinity`)
+- Good for testing and simple use cases
+
+**RpcEx.RetryPolicy.Smart**
+- Stops immediately on authentication/handshake failures
+- Retries indefinitely on network/connection errors
+- Configurable via callbacks for custom fatal error detection
+- Recommended for production deployments
+
+### Custom Policies
+
+Implement the `RpcEx.RetryPolicy` behavior:
+
+```elixir
+defmodule MyApp.CustomRetryPolicy do
+  @behaviour RpcEx.RetryPolicy
+
+  @impl true
+  def initial_state(opts) do
+    %{max_retries: Keyword.get(opts, :max_retries, 3)}
+  end
+
+  @impl true
+  def should_retry?(reason, attempt, state) do
+    if attempt < state.max_retries do
+      {:retry, state}
+    else
+      {:stop, {:max_retries_exceeded, reason}}
+    end
+  end
+end
+```
+
+See `RpcEx.RetryPolicy` for detailed documentation.
+
 ## Middleware
 
 Add cross-cutting concerns with middleware:
@@ -292,6 +365,7 @@ RpcEx is under active development. Core protocol, router DSL, and bidirectional 
 - ✅ Router DSL with middleware
 - ✅ Bidirectional RPC
 - ✅ Client reconnection logic
+- ✅ Pluggable retry policies
 - ✅ Concurrent call handling
 - 🚧 Telemetry instrumentation
 - 📋 Production hardening (rate limiting, backpressure)

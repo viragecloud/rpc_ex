@@ -7,6 +7,43 @@ defmodule RpcEx.Client do
   * Dispatch calls & casts, correlate replies, and enforce per-call timeouts.
   * Forward inbound server-initiated RPC messages through the router executor.
   * Support optional reflection (`discover/2`) and server notifications.
+
+  ## Reconnection and Retry Policies
+
+  The client supports automatic reconnection with pluggable retry policies that
+  determine whether to retry after a disconnect.
+
+  ### Retry Policy Options
+
+  Use the `:retry_policy` option to specify a retry policy module and options:
+
+      {RpcEx.Client,
+        url: "wss://api.example.com",
+        router: MyRouter,
+        retry_policy: {RpcEx.RetryPolicy.Smart, []}}
+
+  Available policies:
+
+  * `RpcEx.RetryPolicy.Simple` - Retries up to max_attempts (default when using `:reconnect` option)
+  * `RpcEx.RetryPolicy.Smart` - Intelligent retry based on error type (auth failures stop, network errors retry)
+
+  ### Legacy Reconnect Option
+
+  The `:reconnect` option is still supported for backward compatibility and maps
+  to `RpcEx.RetryPolicy.Simple`:
+
+      # Retry indefinitely (default)
+      {RpcEx.Client, url: "ws://localhost:4000", reconnect: true}
+
+      # Retry up to 5 times
+      {RpcEx.Client, url: "ws://localhost:4000", reconnect: [max_attempts: 5]}
+
+      # Never retry
+      {RpcEx.Client, url: "ws://localhost:4000", reconnect: false}
+
+  When both `:retry_policy` and `:reconnect` are specified, `:retry_policy` takes precedence.
+
+  See `RpcEx.RetryPolicy` for more details on implementing custom retry policies.
   """
 
   use GenServer
@@ -32,6 +69,7 @@ defmodule RpcEx.Client do
           | {:handshake, keyword()}
           | {:context, map()}
           | {:reconnect, boolean() | keyword()}
+          | {:retry_policy, {module(), keyword()}}
           | {:telemetry_prefix, [atom()]}
           | {:transport_opts, keyword()}
           | {:websocket_opts, keyword()}
@@ -69,7 +107,10 @@ defmodule RpcEx.Client do
               hello_sent?: false,
               reconnect_config: nil,
               reconnect_attempt: 0,
-              reconnect_timer: nil
+              reconnect_timer: nil,
+              retry_policy_module: nil,
+              retry_policy_opts: nil,
+              retry_policy_state: nil
   end
 
   ## Public API
@@ -145,6 +186,9 @@ defmodule RpcEx.Client do
     websocket_opts = Keyword.get(opts, :websocket_opts, compress: false)
     reconnect_config = parse_reconnect_config(Keyword.get(opts, :reconnect, true))
 
+    {retry_policy_module, retry_policy_opts, retry_policy_state} =
+      parse_retry_policy(opts, reconnect_config)
+
     {scheme, host, port, path} = connection_target(opts)
 
     local_handshake = Handshake.build(handshake_opts)
@@ -167,6 +211,9 @@ defmodule RpcEx.Client do
       transport_opts: transport_opts,
       websocket_opts: websocket_opts,
       reconnect_config: reconnect_config,
+      retry_policy_module: retry_policy_module,
+      retry_policy_opts: retry_policy_opts,
+      retry_policy_state: retry_policy_state,
       connection_status: :connecting
     }
 
@@ -305,14 +352,18 @@ defmodule RpcEx.Client do
         stream = build_stream(self(), msg_id, timeout)
 
         # Store the from ref and stream state
-        timer = if timeout != :infinity, do: Process.send_after(self(), {:stream_timeout, msg_id}, timeout), else: nil
+        timer =
+          if timeout != :infinity,
+            do: Process.send_after(self(), {:stream_timeout, msg_id}, timeout),
+            else: nil
 
-        pending_streams = Map.put(state.pending_streams, msg_id, %{
-          from: from,
-          timer: timer,
-          chunks: [],
-          status: :streaming
-        })
+        pending_streams =
+          Map.put(state.pending_streams, msg_id, %{
+            from: from,
+            timer: timer,
+            chunks: [],
+            status: :streaming
+          })
 
         {:reply, {:ok, stream, %{}}, %{state | pending_streams: pending_streams}}
 
@@ -334,24 +385,30 @@ defmodule RpcEx.Client do
         case {stream_state.chunks, stream_state.status} do
           # Has buffered chunks - return first one
           {[chunk | rest], _} ->
-            pending_streams = Map.update!(state.pending_streams, msg_id, fn st ->
-              %{st | chunks: rest}
-            end)
+            pending_streams =
+              Map.update!(state.pending_streams, msg_id, fn st ->
+                %{st | chunks: rest}
+              end)
+
             {:reply, {:chunk, chunk}, %{state | pending_streams: pending_streams}}
 
           # No chunks but complete - return complete
           {[], :complete} ->
-            {:reply, :stream_complete, %{state | pending_streams: Map.delete(state.pending_streams, msg_id)}}
+            {:reply, :stream_complete,
+             %{state | pending_streams: Map.delete(state.pending_streams, msg_id)}}
 
           # No chunks but error - return error
           {[], {:error, {code, error}}} ->
-            {:reply, {:stream_error, {code, error}}, %{state | pending_streams: Map.delete(state.pending_streams, msg_id)}}
+            {:reply, {:stream_error, {code, error}},
+             %{state | pending_streams: Map.delete(state.pending_streams, msg_id)}}
 
           # No chunks and still streaming - wait for next chunk
           {[], :streaming} ->
-            pending_streams = Map.update!(state.pending_streams, msg_id, fn st ->
-              Map.put(st, :waiting_from, from)
-            end)
+            pending_streams =
+              Map.update!(state.pending_streams, msg_id, fn st ->
+                Map.put(st, :waiting_from, from)
+              end)
+
             {:noreply, %{state | pending_streams: pending_streams}}
         end
     end
@@ -569,15 +626,24 @@ defmodule RpcEx.Client do
           |> Map.replace!(:session, session)
           |> Map.replace!(:context, context)
 
-        # Successful connection - reset reconnect attempt counter
+        # Successful connection - reset reconnect attempt counter and retry policy state
         Logger.info("Client connected and ready")
+
+        # Reset retry policy state on successful connection
+        retry_policy_state =
+          if state.retry_policy_module && state.retry_policy_opts do
+            state.retry_policy_module.initial_state(state.retry_policy_opts)
+          else
+            state.retry_policy_state
+          end
 
         {:noreply,
          %{
            state
            | connection_status: :ready,
              connection: connection,
-             reconnect_attempt: 0
+             reconnect_attempt: 0,
+             retry_policy_state: retry_policy_state
          }}
 
       {:error, reason} ->
@@ -745,9 +811,12 @@ defmodule RpcEx.Client do
         # If someone is waiting for next chunk, reply immediately
         if Map.has_key?(stream_state, :waiting_from) do
           GenServer.reply(stream_state.waiting_from, {:chunk, chunk})
-          pending_streams = Map.update!(pending_streams, msg_id, fn st ->
-            st |> Map.put(:chunks, []) |> Map.delete(:waiting_from)
-          end)
+
+          pending_streams =
+            Map.update!(pending_streams, msg_id, fn st ->
+              st |> Map.put(:chunks, []) |> Map.delete(:waiting_from)
+            end)
+
           %{state | pending_streams: pending_streams}
         else
           %{state | pending_streams: pending_streams}
@@ -765,9 +834,10 @@ defmodule RpcEx.Client do
         if stream_state.timer, do: Process.cancel_timer(stream_state.timer)
 
         # Mark as complete and reply if someone is waiting
-        pending_streams = Map.update!(state.pending_streams, msg_id, fn st ->
-          Map.put(st, :status, :complete)
-        end)
+        pending_streams =
+          Map.update!(state.pending_streams, msg_id, fn st ->
+            Map.put(st, :status, :complete)
+          end)
 
         if Map.has_key?(stream_state, :waiting_from) do
           GenServer.reply(stream_state.waiting_from, :stream_complete)
@@ -788,9 +858,10 @@ defmodule RpcEx.Client do
         if stream_state.timer, do: Process.cancel_timer(stream_state.timer)
 
         # Store error and reply if someone is waiting
-        pending_streams = Map.update!(state.pending_streams, msg_id, fn st ->
-          Map.put(st, :status, {:error, {code, error}})
-        end)
+        pending_streams =
+          Map.update!(state.pending_streams, msg_id, fn st ->
+            Map.put(st, :status, {:error, {code, error}})
+          end)
 
         if Map.has_key?(stream_state, :waiting_from) do
           GenServer.reply(stream_state.waiting_from, {:stream_error, {code, error}})
@@ -914,6 +985,37 @@ defmodule RpcEx.Client do
 
   ## Reconnection Logic
 
+  defp parse_retry_policy(opts, reconnect_config) do
+    case Keyword.fetch(opts, :retry_policy) do
+      {:ok, {policy_module, policy_opts}} ->
+        # Explicit retry policy provided
+        policy_state = policy_module.initial_state(policy_opts)
+        {policy_module, policy_opts, policy_state}
+
+      :error ->
+        # No explicit retry policy - derive from reconnect config
+        derive_retry_policy_from_reconnect(reconnect_config)
+    end
+  end
+
+  defp derive_retry_policy_from_reconnect(nil) do
+    # No reconnect config and no retry policy - default to Simple with max_attempts: 0
+    opts = [max_attempts: 0]
+    {RpcEx.RetryPolicy.Simple, opts, RpcEx.RetryPolicy.Simple.initial_state(opts)}
+  end
+
+  defp derive_retry_policy_from_reconnect(%{enabled: false}) do
+    # Reconnect disabled - use Simple with max_attempts: 0
+    opts = [max_attempts: 0]
+    {RpcEx.RetryPolicy.Simple, opts, RpcEx.RetryPolicy.Simple.initial_state(opts)}
+  end
+
+  defp derive_retry_policy_from_reconnect(%{max_attempts: max_attempts}) do
+    # Use Simple policy with max_attempts from reconnect config
+    opts = [max_attempts: max_attempts]
+    {RpcEx.RetryPolicy.Simple, opts, RpcEx.RetryPolicy.Simple.initial_state(opts)}
+  end
+
   defp parse_reconnect_config(false), do: nil
   defp parse_reconnect_config(nil), do: nil
 
@@ -954,12 +1056,31 @@ defmodule RpcEx.Client do
         connection_status: :disconnected
     }
 
-    case should_reconnect?(state) do
-      true ->
-        schedule_reconnect(state)
+    # Consult retry policy
+    case state.retry_policy_module do
+      nil ->
+        # Fall back to legacy reconnect config if no retry policy
+        case should_reconnect?(state) do
+          true -> schedule_reconnect(state)
+          false -> {:stop, reason, state}
+        end
 
-      false ->
-        {:stop, reason, state}
+      policy_module ->
+        case policy_module.should_retry?(
+               reason,
+               state.reconnect_attempt,
+               state.retry_policy_state
+             ) do
+          {:retry, new_policy_state} ->
+            schedule_reconnect(%{state | retry_policy_state: new_policy_state})
+
+          {:stop, stop_reason} ->
+            Logger.error(
+              "Retry policy determined connection should not be retried: #{inspect(stop_reason)}"
+            )
+
+            {:stop, stop_reason, state}
+        end
     end
   end
 

@@ -131,7 +131,15 @@ defmodule RpcEx.Runtime.Dispatcher do
 
         # Spawn a task to handle the streaming
         Task.start(fn ->
-          execute_stream_handler(router, route, msg_id, args, base_context, dispatch_opts, caller_pid)
+          execute_stream_handler(
+            router,
+            route,
+            msg_id,
+            args,
+            base_context,
+            dispatch_opts,
+            caller_pid
+          )
         end)
 
         :async
@@ -155,16 +163,22 @@ defmodule RpcEx.Runtime.Dispatcher do
           stream_enumerable(enumerable, msg_id, caller_pid)
 
         {:error, {:unknown_route, _}} ->
-          error_frame = build_stream_error_frame(msg_id, :unknown_route, "Unknown route: #{route}")
+          error_frame =
+            build_stream_error_frame(msg_id, :unknown_route, "Unknown route: #{route}")
+
           send(caller_pid, {:stream_error, error_frame})
       end
     rescue
       exception ->
-        error_frame = build_stream_error_frame(msg_id, :internal_error, Exception.message(exception))
+        error_frame =
+          build_stream_error_frame(msg_id, :internal_error, Exception.message(exception))
+
         send(caller_pid, {:stream_error, error_frame})
     catch
       kind, reason ->
-        error_frame = build_stream_error_frame(msg_id, :internal_error, "#{kind}: #{inspect(reason)}")
+        error_frame =
+          build_stream_error_frame(msg_id, :internal_error, "#{kind}: #{inspect(reason)}")
+
         send(caller_pid, {:stream_error, error_frame})
     end
   end
@@ -174,27 +188,35 @@ defmodule RpcEx.Runtime.Dispatcher do
       enumerable
       |> Stream.with_index(1)
       |> Enum.each(fn {chunk, sequence} ->
-        frame = Frame.new(:stream, %{
-          msg_id: msg_id,
-          chunk: chunk,
-          meta: %{sequence: sequence}
-        })
+        frame =
+          Frame.new(:stream, %{
+            msg_id: msg_id,
+            chunk: chunk,
+            meta: %{sequence: sequence}
+          })
+
         send(caller_pid, {:stream_chunk, frame})
       end)
 
       # Send stream_end when complete
-      end_frame = Frame.new(:stream_end, %{
-        msg_id: msg_id,
-        meta: %{}
-      })
+      end_frame =
+        Frame.new(:stream_end, %{
+          msg_id: msg_id,
+          meta: %{}
+        })
+
       send(caller_pid, {:stream_end, end_frame})
     rescue
       exception ->
-        error_frame = build_stream_error_frame(msg_id, :stream_error, Exception.message(exception))
+        error_frame =
+          build_stream_error_frame(msg_id, :stream_error, Exception.message(exception))
+
         send(caller_pid, {:stream_error, error_frame})
     catch
       kind, reason ->
-        error_frame = build_stream_error_frame(msg_id, :stream_error, "#{kind}: #{inspect(reason)}")
+        error_frame =
+          build_stream_error_frame(msg_id, :stream_error, "#{kind}: #{inspect(reason)}")
+
         send(caller_pid, {:stream_error, error_frame})
     end
   end
