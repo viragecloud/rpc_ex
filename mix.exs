@@ -61,8 +61,8 @@ defmodule RpcEx.MixProject do
   defp docs do
     [
       name: "RpcEx",
-      source_url: "https://github.com/virage/rpc_ex",
-      homepage_url: "https://github.com/virage/rpc_ex",
+      source_url: "https://github.com/viragecloud/rpc_ex",
+      homepage_url: "https://github.com/viragecloud/rpc_ex",
       main: "readme",
       extras: [
         "README.md",
